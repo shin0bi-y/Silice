@@ -4,6 +4,9 @@
       "name" : "icarus"
     },
     {
+      "name" : "debug"
+    },
+    {
       "name" : "verilator"
     },
     {
