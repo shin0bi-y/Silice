@@ -24,6 +24,11 @@ cd ..
 
 cd ..
 
+cd tools/silice-debugger/
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release -G "Unix Makefiles" ..
+make -j16 install
+
 echo " "
 echo " "
 echo "==================================" 
