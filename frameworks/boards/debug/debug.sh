@@ -37,3 +37,6 @@ iverilog -o build build.v
 vvp build -fst
 
 echo "Opening silice-debugger..."
+
+silice-debugger .
+
