@@ -3,6 +3,12 @@
 git submodule init
 git submodule update
 
+cd tools/silice-debugger
+git submodule init
+git submodule update
+cd ..
+cd ..
+
 mkdir BUILD
 cd BUILD
 

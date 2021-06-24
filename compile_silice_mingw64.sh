@@ -31,10 +31,3 @@ mingw32-make -j16 install
 cd ..
 
 cd ..
-
-# silice-debugger
-cd tools/silice-debugger/
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release -G "MinGW Makefiles" ..
-mingw32-make -j16 install
