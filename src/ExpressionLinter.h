@@ -118,7 +118,8 @@ namespace Silice
       siliceParser::AccessContext                    *access,
       antlr4::tree::TerminalNode                     *identifier,
       siliceParser::Expression_0Context              *expr,
-      const Algorithm::t_combinational_block_context *bctx) const;
+      const Algorithm::t_combinational_block_context *bctx,
+      bool                                            wire_definition = false) const;
 
     /// \brief Lint a wire assignment
     void lintWireAssignment(
@@ -160,7 +161,7 @@ namespace Silice
     }
 
     /// \brief get a token from a source interval (helper)
-    antlr4::Token              *getToken(antlr4::misc::Interval interval);
+    antlr4::Token              *getToken(antlr4::misc::Interval interval,bool last_else_first = false);
     /// \brief returns the source file and line for the given token (helper)
     std::pair<std::string, int> getTokenSourceFileAndLine(antlr4::Token *tk);
 

@@ -51,15 +51,16 @@ class LuaPreProcessor;
 #define REG_      "_r"
 #define WIRE      "_w"
 
-#define ALG_INPUT  "in"
-#define ALG_OUTPUT "out"
-#define ALG_INOUT  "inout"
-#define ALG_IDX    "index"
-#define ALG_RUN    "run"
-#define ALG_CALLER "caller"
-#define ALG_DONE   "done"
-#define ALG_CLOCK  "clock"
-#define ALG_RESET  "reset"
+#define ALG_INPUT   "in"
+#define ALG_OUTPUT  "out"
+#define ALG_INOUT   "inout"
+#define ALG_IDX     "index"
+#define ALG_RUN     "run"
+#define ALG_AUTORUN "autorun"
+#define ALG_CALLER  "caller"
+#define ALG_DONE    "done"
+#define ALG_CLOCK   "clock"
+#define ALG_RESET   "reset"
 
 // -------------------------------------------------
 
@@ -130,6 +131,8 @@ namespace Silice
 
     /// \brief Set of known modules
     const std::unordered_map<std::string, AutoPtr<Module> >& m_KnownModules;
+    /// \brief Set of known algorithms
+    const std::unordered_map<std::string, AutoPtr<Algorithm> >& m_KnownAlgorithms;
     /// \brief Set of known subroutines
     const std::unordered_map<std::string, siliceParser::SubroutineContext*>& m_KnownSubroutines;
     /// \brief Set of known circuitries
@@ -177,7 +180,7 @@ public:
     enum e_IOType { e_Input, e_Output, e_InOut, e_NotIO };
 
     /// \brief base info about variables, inputs, outputs
-    class t_var_nfo {
+    class t_var_nfo { // NOTE: if changed, remember to check var_nfo_copy
     public:
       std::string  name;
       t_type_nfo   type_nfo;
@@ -231,9 +234,11 @@ private:
       siliceParser::GroupContext    *group           = nullptr; // from an actual group declaration
       siliceParser::IntrfaceContext *intrface        = nullptr; // from an interface declaration
       siliceParser::DeclarationMemoryContext *memory = nullptr; // from a memory declaration
+      const Algorithm               *alg             = nullptr; // from an algorithm
       t_group_definition(siliceParser::GroupContext *g) : group(g)    {}
       t_group_definition(siliceParser::IntrfaceContext *i) : intrface(i) {}
       t_group_definition(siliceParser::DeclarationMemoryContext *m) : memory(m) {}
+      t_group_definition(const Algorithm *a) : alg(a) {}
     };
 
     /// \brief inputs
@@ -621,7 +626,8 @@ private:
     t_combinational_block                                             m_AlwaysPre;
     t_combinational_block                                             m_AlwaysPost;
     /// \brief wire assignments
-    std::unordered_map<std::string,t_instr_nfo>                       m_WireAssignments;
+    std::unordered_map<std::string, int>                              m_WireAssignmentNames;
+    std::vector<std::pair<std::string,t_instr_nfo> >                  m_WireAssignments;
     /// \brief all combinational blocks
     std::list< t_combinational_block* >                               m_Blocks;
     /// \brief state name to combinational block
@@ -636,17 +642,23 @@ private:
     int m_NextBlockName = 1;
     /// \brief indicates whether this algorithm is the topmost in the design
     bool m_TopMost      = false;
-    /// \brief indicates whether a VIO report has to be generated and what the filename is (empty means none)
-    std::string m_VIOReportName;
     /// \brief indicates whether a FSM report has to be generated and what the filename is (empty means none)
-    std::string m_FSMReportName;
+    std::string m_ReportBaseName;
     /// \brief internally set to true when the report has to be written
-    bool        m_FSMReportEnable;
+    bool        m_ReportingEnabled = false;
+    /// \brief recalls whether the algorithm is already optimized
+    bool        m_Optimized = false;
+
+    std::string fsmReportName() const { return m_ReportBaseName  + ".fsm.log"; }
+    std::string vioReportName() const { return m_ReportBaseName + ".vio.log"; }
+    std::string algReportName() const { return m_ReportBaseName + ".alg.log"; }
 
   public:
 
     /// \brief information about instantiation (public for linter)
     typedef struct {
+      std::string                                  instance_name;
+      std::string                                  local_instance_name;
       std::unordered_map<std::string, std::string> parameters;
     } t_instantiation_context;
 
@@ -789,8 +801,6 @@ private:
     t_combinational_block *gatherRepeatBlock(siliceParser::RepeatBlockContext* repeat, t_combinational_block *_current, t_gather_context *_context);
     /// \brief gather always assigned
     void gatherAlwaysAssigned(siliceParser::AlwaysAssignedListContext* alws, t_combinational_block *always);
-    ///\brief Runs the linter on the algorithm, at instantiation time
-    void lint(const t_instantiation_context &ictx);
     /// \brief check access permissions (recursively) from a specific node
     void checkPermissions(antlr4::tree::ParseTree *node, t_combinational_block *_current);
     /// \brief check access permissions on all block instructions
@@ -811,6 +821,8 @@ private:
     void gatherInoutNfo(siliceParser::InoutContext* inout, t_inout_nfo& _io);
     /// \brief gather infos about an io definition (group/interface)
     void gatherIoDef(siliceParser::IoDefContext *iod, t_combinational_block *_current, t_gather_context *_context);
+    /// \brief gather infos about outputs of an algorithm
+    void gatherAllOutputsNfo(siliceParser::OutputsContext *allouts, t_combinational_block *_current, t_gather_context *_context);
     /// \brief gather infos about an io group
     void gatherIoGroup(siliceParser::IoDefContext * iog, t_combinational_block *_current, t_gather_context *_context);
     /// \brief gather infos about an io interface
@@ -860,6 +872,11 @@ private:
     /// \brief report an error
     void reportError(antlr4::Token* what, int line, const char *msg, ...) const;
     void reportError(antlr4::misc::Interval interval, int line, const char *msg, ...) const;
+    /// \brief run optimizations
+    void optimize();
+    ///\brief Runs the linter on the algorithm, at instantiation time
+    void lint(const t_instantiation_context &ictx);
+
     /// \brief Pre-processor, optionally set
     static LuaPreProcessor *s_LuaPreProcessor;
 
@@ -883,7 +900,7 @@ private:
     std::string determineAccessedVar(siliceParser::BitAccessContext* access, const t_combinational_block_context* bctx) const;
     std::string determineAccessedVar(siliceParser::BitfieldAccessContext* access, const t_combinational_block_context* bctx) const;
     std::string determineAccessedVar(siliceParser::TableAccessContext* access, const t_combinational_block_context* bctx) const;
-    /// \brief determine variables/inputs/outputs access within an instruction (from its tree)
+    /// \brief determine which VIO are accessed by an instruction (from its tree)
     void determineVIOAccess(
       antlr4::tree::ParseTree*                    node,
       const std::unordered_map<std::string, int>& vios,
@@ -899,26 +916,26 @@ private:
     template<typename T_nfo>
     void updateAccessFromBinding(const t_binding_nfo& b, const std::unordered_map<std::string, int > &names, std::vector< T_nfo > &_nfos);
     /// \brief determines variable access for an instruction
-    void determineVariablesAndOutputsAccess(
+    void determineAccess(
       antlr4::tree::ParseTree             *instr,
       const t_combinational_block_context *context,
       std::unordered_set<std::string> &_already_written, 
       std::unordered_set<std::string> &_in_vars_read,
       std::unordered_set<std::string> &_out_vars_written);
     /// \brief determines variable access within a block
-    void determineVariablesAndOutputsAccess(t_combinational_block *block);
+    void determineAccess(t_combinational_block *block);
     /// \brief determine variable access due to wires within the algorithm
-    void determineVariablesAndOutputsAccessForWires(
+    void determineAccessForWires(
       std::unordered_set<std::string> &_global_in_read,
       std::unordered_set<std::string> &_global_out_written
     );
     /// \brief determine variable access within the algorithm
-    void determineVariablesAndOutputsAccess(
+    void determineAccess(
       std::unordered_set<std::string> &_global_in_read,
       std::unordered_set<std::string> &_global_out_written
     );
     /// \brief analyze variables access and classifies variables
-    void determineVariableAndOutputsUsage();
+    void determineUsage();
     /// \brief determines the list of bound VIO
     void determineModAlgBoundVIO();
     /// \brief analyze the subroutine calls
@@ -943,6 +960,8 @@ private:
     int  toFSMState(int state) const;
     /// \brief finds the binding to var
     const t_binding_nfo &findBindingTo(std::string var, const std::vector<t_binding_nfo> &bndgs, bool &_found) const;
+    /// \brief returns the line range of an instruction
+    v2i instructionLines(antlr4::tree::ParseTree *instr, const t_instantiation_context &ictx) const;
 
   public:
 
@@ -952,10 +971,11 @@ private:
       std::string clock, std::string reset,
       bool autorun, bool onehot,
       const std::unordered_map<std::string, AutoPtr<Module> >&                 known_modules,
+      const std::unordered_map<std::string, AutoPtr<Algorithm> >&              known_algorithms,
       const std::unordered_map<std::string, siliceParser::SubroutineContext*>& known_subroutines,
       const std::unordered_map<std::string, siliceParser::CircuitryContext*>&  known_circuitries,
       const std::unordered_map<std::string, siliceParser::GroupContext*>&      known_groups,
-      const std::unordered_map<std::string, siliceParser::IntrfaceContext *>& known_interfaces,
+      const std::unordered_map<std::string, siliceParser::IntrfaceContext *>&  known_interfaces,
       const std::unordered_map<std::string, siliceParser::BitfieldContext*>&   known_bitfield);
     /// \brief destructor
     virtual ~Algorithm();
@@ -967,8 +987,6 @@ private:
     void resolveModuleRefs(const std::unordered_map<std::string, AutoPtr<Module> >& modules);
     /// \brief resolve instanced algorithms refs
     void resolveAlgorithmRefs(const std::unordered_map<std::string, AutoPtr<Algorithm> >& algorithms);
-    /// \brief run optimizations
-    void optimize();
 
   private:
 
@@ -1051,11 +1069,11 @@ private:
     /// \brief writes all states in the output
     void writeCombinationalStates(std::string prefix, std::ostream &out, const t_instantiation_context &ictx, const t_vio_dependencies &always_dependencies, t_vio_ff_usage &_ff_usage, t_vio_dependencies &_post_dependencies) const;
     /// \brief writes a graph of stateless blocks to the output, until a jump to other states is reached
-    void writeStatelessBlockGraph(std::string prefix, std::ostream& out, const t_instantiation_context &ictx, const t_combinational_block* block, const t_combinational_block* stop_at, std::queue<size_t>& _q, t_vio_dependencies& _dependencies, t_vio_ff_usage &_ff_usage, t_vio_dependencies &_post_dependencies) const;
+    void writeStatelessBlockGraph(std::string prefix, std::ostream& out, const t_instantiation_context &ictx, const t_combinational_block* block, const t_combinational_block* stop_at, std::queue<size_t>& _q, t_vio_dependencies& _dependencies, t_vio_ff_usage &_ff_usage, t_vio_dependencies &_post_dependencies, std::set<v2i> &_lines) const;
     /// \brief writes a stateless pipeline to the output, returns zhere to resume from
-    const t_combinational_block *writeStatelessPipeline(std::string prefix, std::ostream& out, const t_instantiation_context &ictx, const t_combinational_block* block_before, std::queue<size_t>& _q, t_vio_dependencies& _dependencies, t_vio_ff_usage &_ff_usage, t_vio_dependencies &_post_dependencies) const;
+    const t_combinational_block *writeStatelessPipeline(std::string prefix, std::ostream& out, const t_instantiation_context &ictx, const t_combinational_block* block_before, std::queue<size_t>& _q, t_vio_dependencies& _dependencies, t_vio_ff_usage &_ff_usage, t_vio_dependencies &_post_dependencies, std::set<v2i> &_lines) const;
     /// \brief writes a single block to the output
-    void writeBlock(std::string prefix, std::ostream &out, const t_instantiation_context &ictx, const t_combinational_block *block, t_vio_dependencies &_dependencies, t_vio_ff_usage &_ff_usage) const;
+    void writeBlock(std::string prefix, std::ostream &out, const t_instantiation_context &ictx, const t_combinational_block *block, t_vio_dependencies &_dependencies, t_vio_ff_usage &_ff_usage, std::set<v2i>& _lines) const;
     /// \brief writes variable inits
     void writeVarInits(std::string prefix, std::ostream& out, const t_instantiation_context &ictx, const std::unordered_map<std::string, int >& varnames, t_vio_dependencies& _dependencies, t_vio_ff_usage &_ff_usage) const;
     /// \brief writes a memory module
@@ -1065,19 +1083,16 @@ private:
     /// \brief prepare replacements for a memory module template
     void prepareModuleMemoryTemplateReplacements(std::string instance_name, const t_mem_nfo& bram, std::unordered_map<std::string, std::string>& _replacements) const;
     /// \brief writes the algorithm as a Verilog module, recurses through instanced algorithms
-    void writeAsModule(std::string instance_name, std::ostream &out, const t_instantiation_context &ictx, bool first_pass);
+    void writeAsModule(std::ostream &out, const t_instantiation_context &ictx, bool first_pass);
     /// \brief writes the algorithm as a Verilog module, calls the version above twice in a two pass optimization process
-    void writeAsModule(std::string instance_name, std::ostream &out, const t_instantiation_context& ictx, t_vio_ff_usage &_ff_usage, bool do_lint) const;
+    void writeAsModule(std::ostream &out, const t_instantiation_context& ictx, t_vio_ff_usage &_ff_usage, bool do_lint) const;
     /// \brief outputs a report on the VIOs in the algorithm
-    void outputVIOReport(std::string instance_name, const t_instantiation_context &ictx) const;
+    void outputVIOReport(const t_instantiation_context &ictx) const;
 
   public:
 
-    /// \brief asks for a VIO report to be generated
-    void enableVIOReport(std::string reportname);
-
-    /// \brief asks for an FSM report to be generated
-    void enableFSMReport(std::string reportname);
+    /// \brief asks reports to be generated
+    void enableReporting(std::string reportname);
 
     /// \brief writes a topmost algorithm as a Verilog module, recurses through instanced algorithms
     void writeAsModule(std::string instance_name,std::ostream& out);

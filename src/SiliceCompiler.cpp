@@ -113,7 +113,7 @@ void SiliceCompiler::gatherAll(antlr4::tree::ParseTree* tree)
     }
     AutoPtr<Algorithm> algorithm(new Algorithm(
       name, clock, reset, autorun, onehot,
-      m_Modules, m_Subroutines, m_Circuitries, m_Groups, m_Interfaces, m_BitFields)
+      m_Modules, m_Algorithms, m_Subroutines, m_Circuitries, m_Groups, m_Interfaces, m_BitFields)
     );
     if (m_Algorithms.find(name) != m_Algorithms.end()) {
       throw Fatal("an algorithm with same name already exists (line %d)!", (int)alg->getStart()->getLine());
@@ -257,6 +257,7 @@ void SiliceCompiler::run(
   CONFIG.keyValues()["libraries_path"] = frameworks_dir + "/libraries";
   // preprocessor
   LuaPreProcessor lpp;
+  lpp.enableFilesReport(fresult + ".files.log");
   std::string preprocessed = std::string(fsource) + ".lpp";
   lpp.run(fsource, c_DefaultLibraries, header, preprocessed);
   // display config
@@ -295,11 +296,6 @@ void SiliceCompiler::run(
         alg.second->resolveModuleRefs(m_Modules);
       }
 
-      // optimize
-      for (const auto& alg : m_Algorithms) {
-        alg.second->optimize();
-      }
-
       // save the result
       {
         std::ofstream out(fresult);
@@ -322,8 +318,7 @@ void SiliceCompiler::run(
           m->writeModule(out);
         }
         // ask for reports
-        m_Algorithms["main"]->enableVIOReport(fresult + ".vio.log");
-        m_Algorithms["main"]->enableFSMReport(fresult + ".fsm.log");
+        m_Algorithms["main"]->enableReporting(fresult);
         // write top algorithm (recurses from there)
         m_Algorithms["main"]->writeAsModule("",out);
 

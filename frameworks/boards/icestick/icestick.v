@@ -6,7 +6,7 @@ $$NUM_LEDS=5
 $$VGA=1
 $$color_depth=6
 $$color_max  =63
-$$config['bram_wenable_width'] = 'data'
+$$config['bram_wenable_width'] = '1'
 $$config['dualport_bram_wenable0_width'] = 'data'
 $$config['dualport_bram_wenable1_width'] = 'data'
 $$config['simple_dualport_bram_wenable0_width'] = 'data'
@@ -121,7 +121,7 @@ assign run_main = 1'b1;
 
 M_main __main(
   .clock(CLK),
-  .reset(RST_d),
+  .reset(RST_q[0]),
   .out_leds(__main_leds),
 `ifdef OLED
   .out_oled_mosi(__main_oled_mosi),

@@ -1,6 +1,6 @@
 void main() 
 {
-  volatile int* const LEDS = (int*)0x1004;
+  volatile int* const LEDS = (int*)0x2004;
   volatile int i = 0;
 
   *LEDS = 0x0f;
@@ -13,10 +13,10 @@ void main()
       l = 1;
     }
     
-    *LEDS = l; // (l | 16);
+    *LEDS = l;    
     
     for (i=0;i<655360;i++) { }
-  
+
   }
   
 }

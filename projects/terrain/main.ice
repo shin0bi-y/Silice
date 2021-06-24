@@ -64,6 +64,8 @@ $$code_size_bytes = init_data_bytes
 $include('../fire-v/fire-v/fire-v.ice')
 $$if SIMULATION then
 $$ bram_depth=14   -- in simulation we embed data into the code, so we use a large BRAM
+$$else
+$$ bram_depth=11
 $$end
 // include memory segment for the processor (BRAM only)
 $include('../fire-v/ash/bram_ram_32bits.ice')
@@ -353,8 +355,8 @@ $$end
     next_pixel       = {next_pixel[0,1],next_pixel[1,1]};
   }
 
-$$if SIMULATION then  
-  while (iter != 6000000) { // in siumlation we limit the number of cycles
+$$if ICARUS then  
+  while (iter != 2000000) { // in siumlation we limit the number of cycles
     iter = iter + 1;
 $$else
   while (1) {

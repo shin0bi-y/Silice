@@ -118,7 +118,7 @@ void Algorithm::checkAlgorithmsBindings(const t_instantiation_context &ictx) con
       bool is_inout  = ia.second.algo->isInOut (b.left);
       if (!is_input && !is_output && !is_inout) {
         if (m_VIOGroups.count(bindingRightIdentifier(b)) > 0) {
-          reportError(nullptr, b.line, "instanced module '%s', binding '%s': use <:> to bind groups and interfaces",
+          reportError(nullptr, b.line, "instanced algorithm '%s', binding '%s': use <:> to bind groups and interfaces",
             ia.first.c_str(), b.left.c_str());
         } else {
           reportError(nullptr, b.line, "instanced algorithm '%s', binding '%s': wrong binding point (neither input nor output)",
@@ -150,6 +150,17 @@ void Algorithm::checkAlgorithmsBindings(const t_instantiation_context &ictx) con
       if (b.dir == e_Left || b.dir == e_LeftQ) {
         // track inbound
         inbound.insert(br);
+      }
+      // check combinational output consistency
+      if (is_output && isOutput(br)) {
+        sl_assert(b.dir == e_Right);
+        // instance output is bound to an algorithm output
+        bool instr_comb = ia.second.algo->m_Outputs.at(ia.second.algo->m_OutputNames.at(b.left)).combinational;
+        if ( m_Outputs.at(m_OutputNames.at(br)).combinational ^ instr_comb) {
+          reportError(nullptr, b.line, "instanced algorithm '%s', binding instance output '%s' to algorithm output '%s'\n"
+            "using a mix of output! and output. Consider adjusting the parent algorithm output to '%s'.",
+            ia.first.c_str(), b.left.c_str(), br.c_str(), instr_comb ? "output!" : "output");
+        }
       }
       // lint
       ExpressionLinter linter(this,ictx);
@@ -578,7 +589,7 @@ std::string Algorithm::gatherBitfieldValue(siliceParser::InitBitfieldContext* if
   // find field definition
   auto F = m_KnownBitFields.find(ifield->field->getText());
   if (F == m_KnownBitFields.end()) {
-    reportError(ifield->getSourceInterval(), (int)ifield->getStart()->getLine(), "unkown bitfield '%s'", ifield->field->getText().c_str());
+    reportError(ifield->getSourceInterval(), (int)ifield->getStart()->getLine(), "unknown bitfield '%s'", ifield->field->getText().c_str());
   }
   // gather const values for each named entry
   unordered_map<string, pair<bool,string> > named_values;
@@ -721,7 +732,8 @@ void Algorithm::gatherDeclarationWire(siliceParser::DeclarationWireContext* wire
   // add var
   addVar(nfo, _current, _context, wire->alwaysAssigned()->IDENTIFIER()->getSourceInterval());
   // insert wire assignment
-  m_WireAssignments.insert(make_pair(nfo.name, t_instr_nfo(wire->alwaysAssigned(), _current, -1)));
+  m_WireAssignmentNames.insert( make_pair(nfo.name, m_WireAssignments.size()) );
+  m_WireAssignments    .push_back( make_pair(nfo.name, t_instr_nfo(wire->alwaysAssigned(), _current, -1)) );
 }
 
 // -------------------------------------------------
@@ -1122,7 +1134,7 @@ void Algorithm::gatherDeclarationMemory(siliceParser::DeclarationMemoryContext* 
         mem.custom_template = mod->STRING()->getText();
         mem.custom_template = mem.custom_template.substr(1, mem.custom_template.size() - 2);
       } else {
-        reportError(mod->getSourceInterval(), (int)mod->getStart()->getLine(), "unkonwn modifier");
+        reportError(mod->getSourceInterval(), (int)mod->getStart()->getLine(), "unknown modifier");
       }
     }
   }
@@ -1175,8 +1187,8 @@ void Algorithm::gatherDeclarationMemory(siliceParser::DeclarationMemoryContext* 
       mem.in_vars.push_back(v.name);
     } else {
       mem.out_vars.push_back(v.name);
+      m_VIOBoundToModAlgOutputs[v.name] = WIRE "_mem_" + v.name;
     }
-    m_VIOBoundToModAlgOutputs[v.name] = WIRE "_mem_" + v.name;
   }
   // add memory
   m_Memories.emplace_back(mem);
@@ -1199,16 +1211,16 @@ void Algorithm::getBindings(
         _autobind = true;
       } else {
         // check if this is a group binding
-        if (bindings->modalgBinding()->BDEFINE() != nullptr || bindings->modalgBinding()->BDEFINEDBL() != nullptr) {
+        if ((bindings->modalgBinding()->BDEFINE() != nullptr || bindings->modalgBinding()->BDEFINEDBL() != nullptr)) {
+          // verify right is an identifier
+          if (bindings->modalgBinding()->right->IDENTIFIER() == nullptr) {
+            reportError(
+              bindings->modalgBinding()->getSourceInterval(),
+              (int)bindings->modalgBinding()->right->getStart()->getLine(),
+              "expecting an identifier on the right side of a group binding");
+          }
           auto G = m_VIOGroups.find(bindings->modalgBinding()->right->getText());
           if (G != m_VIOGroups.end()) {
-            // verify right is an identifier
-            if (bindings->modalgBinding()->right->IDENTIFIER() == nullptr) {
-              reportError(
-                bindings->modalgBinding()->getSourceInterval(),
-                (int)bindings->modalgBinding()->right->getStart()->getLine(), 
-                "expecting an identifier on the right side of a group binding");
-            }
             // unfold all bindings, select direction automatically
             // NOTE: some members may not be used, these are excluded during auto-binding
             for (auto v : getGroupMembers(G->second)) {
@@ -1225,6 +1237,31 @@ void Algorithm::getBindings(
             continue;
           }
         }
+        // check if this binds an instance (e.g. through 'outputs()')
+        if ((bindings->modalgBinding()->LDEFINE() != nullptr || bindings->modalgBinding()->LDEFINEDBL() != nullptr) 
+          && bindings->modalgBinding()->right->IDENTIFIER() != nullptr) {
+          auto I = m_InstancedAlgorithms.find(bindings->modalgBinding()->right->getText());
+          if (I != m_InstancedAlgorithms.end()) {
+            auto A = m_KnownAlgorithms.find(I->second.algo_name);
+            if (A != m_KnownAlgorithms.end()) {
+              for (const auto &o : A->second->m_Outputs) {
+                string member = o.name;
+                t_binding_nfo nfo;
+                nfo.left = bindings->modalgBinding()->left->getText() + "_" + member;
+                nfo.right = I->second.instance_prefix + "_" + member;
+                nfo.line = (int)bindings->modalgBinding()->getStart()->getLine();
+                nfo.dir = (bindings->modalgBinding()->LDEFINE() != nullptr) ? e_Left : e_LeftQ;
+                _vec_bindings.push_back(nfo);
+              }
+            } else {
+              reportError(nullptr, (int)I->second.instance_line, "algorithm '%s' not yet declared or unknown", I->second.algo_name.c_str());
+            }
+            // skip to next
+            bindings = bindings->modalgBindingList();
+            continue;
+          }
+        }
+        // standard binding
         t_binding_nfo nfo;
         nfo.left = bindings->modalgBinding()->left->getText();
         if (bindings->modalgBinding()->right->IDENTIFIER() != nullptr) {
@@ -1279,7 +1316,7 @@ void Algorithm::gatherDeclarationGroup(siliceParser::DeclarationGrpModAlgContext
       addVar(vnfo, _current, _context, grp->IDENTIFIER()[1]->getSourceInterval());
     }
   } else {
-    reportError(grp->getSourceInterval(), (int)grp->getStart()->getLine(), "unkown group '%s'", grp->modalg->getText().c_str());
+    reportError(grp->getSourceInterval(), (int)grp->getStart()->getLine(), "unknown group '%s'", grp->modalg->getText().c_str());
   }
 }
 
@@ -1783,14 +1820,12 @@ Algorithm::t_combinational_block *Algorithm::splitOrContinueBlock(siliceParser::
 {
   if (ilist->state() != nullptr) {
     // start a new block
-    std::string name = "++";
+    bool no_skip = true;
+    std::string name;
     if (ilist->state()->state_name != nullptr) {
       name = ilist->state()->state_name->getText();
-    }
-    bool no_skip   = false;
-    if (name == "++") {
-      name      = generateBlockName();
-      no_skip   = true;
+    } else {
+      name = generateBlockName();
     }
     t_combinational_block *block = addBlock(name, _current, nullptr, ilist->getSourceInterval());
     block->is_state     = true;    // block explicitely required to be a state (may become a sub-state)
@@ -2695,6 +2730,7 @@ void Algorithm::gatherInputNfo(siliceParser::InputContext* input,t_inout_nfo& _i
 {
   _io.name = input->IDENTIFIER()->getText();
   _io.table_size = 0;
+  _io.source_interval = input->IDENTIFIER()->getSourceInterval();
   // type
   std::string is_group;
   gatherTypeNfo(input->type(), _io.type_nfo, _current, _context, is_group);
@@ -2714,6 +2750,7 @@ void Algorithm::gatherInputNfo(siliceParser::InputContext* input,t_inout_nfo& _i
 void Algorithm::gatherOutputNfo(siliceParser::OutputContext* output, t_output_nfo& _io, t_combinational_block *_current, t_gather_context *_context)
 {
   if (output->declarationVar() != nullptr) {
+    _io.source_interval = output->declarationVar()->IDENTIFIER()->getSourceInterval();
     std::string is_group;
     gatherVarNfo(output->declarationVar(), _io, true, _current, _context, is_group);
     if (_io.type_nfo.base_type == Parameterized) {
@@ -2732,6 +2769,7 @@ void Algorithm::gatherOutputNfo(siliceParser::OutputContext* output, t_output_nf
 
 void Algorithm::gatherInoutNfo(siliceParser::InoutContext* inout, t_inout_nfo& _io)
 {
+  _io.source_interval = inout->IDENTIFIER()->getSourceInterval();
   _io.name = inout->IDENTIFIER()->getText();
   _io.table_size = 0;
   splitType(inout->TYPE()->getText(), _io.type_nfo);
@@ -2751,6 +2789,24 @@ void Algorithm::gatherIoDef(siliceParser::IoDefContext *iod, t_combinational_blo
   } else {
     gatherIoInterface(iod);
   }
+}
+
+// -------------------------------------------------
+
+template <typename T>
+void var_nfo_copy(T& _dst,const Algorithm::t_var_nfo &src)
+{
+  _dst.name               = src.name;
+  _dst.type_nfo           = src.type_nfo;
+  _dst.init_values        = src.init_values;
+  _dst.table_size         = src.table_size;
+  _dst.do_not_initialize  = src.do_not_initialize;
+  _dst.init_at_startup    = src.init_at_startup;
+  _dst.pipeline_prev_name = src.pipeline_prev_name;
+  _dst.access             = src.access;
+  _dst.usage              = src.usage;
+  _dst.attribs            = src.attribs;
+  _dst.source_interval    = src.source_interval;
 }
 
 // -------------------------------------------------
@@ -2777,6 +2833,7 @@ void Algorithm::gatherIoGroup(siliceParser::IoDefContext *iog, t_combinational_b
     t_var_nfo vnfo;
     std::string is_group;
     gatherVarNfo(v->declarationVar(), vnfo, false, _current, _context,is_group);
+    vnfo.source_interval = iog->IDENTIFIER()[1]->getSourceInterval();
     // sameas?
     if (vnfo.type_nfo.base_type == Parameterized) {
       reportError(v->declarationVar()->IDENTIFIER()->getSymbol(), (int)v->declarationVar()->getStart()->getLine(),
@@ -2791,7 +2848,7 @@ void Algorithm::gatherIoGroup(siliceParser::IoDefContext *iog, t_combinational_b
     }
     vars.insert(make_pair(vnfo.name,vnfo));
   }
-
+  // create vars
   if (iog->ioList() != nullptr) {
     for (auto io : iog->ioList()->io()) {
       // -> check for existence
@@ -2803,30 +2860,21 @@ void Algorithm::gatherIoGroup(siliceParser::IoDefContext *iog, t_combinational_b
       // add it where it belongs
       if (io->is_input != nullptr) {
         t_inout_nfo inp;
+        var_nfo_copy(inp, V->second);
         inp.name = grpre + "_" + V->second.name;
-        inp.table_size = V->second.table_size;
-        inp.init_values = V->second.init_values;
-        inp.do_not_initialize = V->second.do_not_initialize;
-        inp.type_nfo = V->second.type_nfo;
         m_Inputs.emplace_back(inp);
         m_InputNames.insert(make_pair(inp.name, (int)m_Inputs.size() - 1));
       } else if (io->is_inout != nullptr) {
         t_inout_nfo inp;
+        var_nfo_copy(inp, V->second);
         inp.name = grpre + "_" + V->second.name;
-        inp.table_size = V->second.table_size;
-        inp.init_values = V->second.init_values;
-        inp.do_not_initialize = V->second.do_not_initialize;
-        inp.type_nfo = V->second.type_nfo;
         inp.nolatch = (io->nolatch != nullptr);
         m_InOuts.emplace_back(inp);
         m_InOutNames.insert(make_pair(inp.name, (int)m_InOuts.size() - 1));
       } else if (io->is_output != nullptr) {
         t_output_nfo oup;
+        var_nfo_copy(oup, V->second);
         oup.name = grpre + "_" + V->second.name;
-        oup.table_size = V->second.table_size;
-        oup.init_values = V->second.init_values;
-        oup.do_not_initialize = V->second.do_not_initialize;
-        oup.type_nfo = V->second.type_nfo;
         oup.combinational = (io->combinational != nullptr);
         m_Outputs.emplace_back(oup);
         m_OutputNames.insert(make_pair(oup.name, (int)m_Outputs.size() - 1));
@@ -2837,11 +2885,8 @@ void Algorithm::gatherIoGroup(siliceParser::IoDefContext *iog, t_combinational_b
       // all input
       for (auto v : vars) {
         t_inout_nfo inp;
+        var_nfo_copy(inp, v.second);
         inp.name = grpre + "_" + v.second.name;
-        inp.table_size = v.second.table_size;
-        inp.init_values = v.second.init_values;
-        inp.do_not_initialize = v.second.do_not_initialize;
-        inp.type_nfo = v.second.type_nfo;
         m_Inputs.emplace_back(inp);
         m_InputNames.insert(make_pair(inp.name, (int)m_Inputs.size() - 1));
       }
@@ -2850,11 +2895,8 @@ void Algorithm::gatherIoGroup(siliceParser::IoDefContext *iog, t_combinational_b
       // all output
       for (auto v : vars) {
         t_output_nfo oup;
+        var_nfo_copy(oup, v.second);
         oup.name = grpre + "_" + v.second.name;
-        oup.table_size = v.second.table_size;
-        oup.init_values = v.second.init_values;
-        oup.do_not_initialize = v.second.do_not_initialize;
-        oup.type_nfo = v.second.type_nfo;
         oup.combinational = (iog->combinational != nullptr);
         m_Outputs.emplace_back(oup);
         m_OutputNames.insert(make_pair(oup.name, (int)m_Outputs.size() - 1));
@@ -2885,46 +2927,66 @@ void Algorithm::gatherIoInterface(siliceParser::IoDefContext *itrf)
     vnfo.type_nfo.width     = 0;
     vnfo.table_size         = 0;
     vnfo.do_not_initialize  = false;
+    vnfo.source_interval    = itrf->IDENTIFIER()[1]->getSourceInterval();
     if (vars.count(vnfo.name)) {
       reportError(io->IDENTIFIER()->getSymbol(), (int)io->getStart()->getLine(),
         "entry '%s' declared twice in interface definition '%s'",
         vnfo.name.c_str(), itrf->defid->getText().c_str());
     }
     vars.insert(vnfo.name);
-    // add it where it belongs
+    // create vars
     if (io->is_input != nullptr) {
       t_inout_nfo inp;
+      var_nfo_copy(inp, vnfo);
       inp.name              = grpre + "_" + vnfo.name;
-      inp.table_size        = vnfo.table_size;
-      inp.init_values       = vnfo.init_values;
-      inp.type_nfo          = vnfo.type_nfo;
-      inp.do_not_initialize = vnfo.do_not_initialize;
       m_Inputs.emplace_back(inp);
       m_InputNames.insert(make_pair(inp.name, (int)m_Inputs.size() - 1));
       m_Parameterized.push_back(inp.name);
     } else if (io->is_inout != nullptr) {
       t_inout_nfo inp;
+      var_nfo_copy(inp, vnfo);
       inp.name              = grpre + "_" + vnfo.name;
-      inp.table_size        = vnfo.table_size;
-      inp.init_values       = vnfo.init_values;
-      inp.type_nfo          = vnfo.type_nfo;
-      inp.do_not_initialize = vnfo.do_not_initialize;
       inp.nolatch           = (io->nolatch != nullptr);
       m_InOuts.emplace_back(inp);
       m_InOutNames.insert(make_pair(inp.name, (int)m_InOuts.size() - 1));
       m_Parameterized.push_back(inp.name);
     } else if (io->is_output != nullptr) {
       t_output_nfo oup;
+      var_nfo_copy(oup, vnfo);
       oup.name              = grpre + "_" + vnfo.name;
-      oup.table_size        = vnfo.table_size;
-      oup.init_values       = vnfo.init_values;
-      oup.type_nfo          = vnfo.type_nfo;
-      oup.do_not_initialize = vnfo.do_not_initialize;
       oup.combinational     = (io->combinational != nullptr);
       m_Outputs.emplace_back(oup);
       m_OutputNames.insert(make_pair(oup.name, (int)m_Outputs.size() - 1));
       m_Parameterized.push_back(oup.name);
     }
+  }
+}
+
+// -------------------------------------------------
+
+void Algorithm::gatherAllOutputsNfo(siliceParser::OutputsContext *allouts, t_combinational_block *_current, t_gather_context *_context)
+{
+  // find algorithm (has to be known / declared before)
+  auto I = m_KnownAlgorithms.find(allouts->alg->getText());
+  if (I == m_KnownAlgorithms.end()) {
+    reportError(allouts->alg, (int)allouts->getStart()->getLine(),
+      "algorithm '%s' not yet declared or unknown", allouts->alg->getText().c_str());
+  }
+  // group prefix
+  string grpre = allouts->grp->getText();
+  m_VIOGroups.insert(make_pair(grpre, I->second.raw()));
+  // get member list from interface
+  for (const auto& o : I->second->m_Outputs) {
+    if (o.type_nfo.base_type == Parameterized) {
+      reportError(allouts->alg, (int)allouts->getStart()->getLine(),
+        "using 'outputs(%s)' when one output is generic (sameas or interface) is not supported", allouts->alg->getText().c_str());
+    }
+    // create input
+    t_inout_nfo inp;
+    var_nfo_copy(inp, o);
+    inp.name = grpre + "_" + o.name;
+    m_Inputs.emplace_back(inp);
+    m_InputNames.insert(make_pair(inp.name, (int)m_Inputs.size() - 1));
   }
 }
 
@@ -2938,10 +3000,11 @@ void Algorithm::gatherIOs(siliceParser::InOutListContext* inout, t_combinational
   for (auto io : inout->inOrOut()) {
     bool found;
     int line         = (int)io->getStart()->getLine();
-    auto input       = dynamic_cast<siliceParser::InputContext*>(io->input());
-    auto output      = dynamic_cast<siliceParser::OutputContext*>(io->output());
-    auto inout       = dynamic_cast<siliceParser::InoutContext*>(io->inout());
-    auto iodef       = dynamic_cast<siliceParser::IoDefContext*>(io->ioDef());
+    auto input       = dynamic_cast<siliceParser::InputContext*>   (io->input());
+    auto output      = dynamic_cast<siliceParser::OutputContext*>  (io->output());
+    auto inout       = dynamic_cast<siliceParser::InoutContext*>   (io->inout());
+    auto iodef       = dynamic_cast<siliceParser::IoDefContext*>   (io->ioDef());
+    auto allouts     = dynamic_cast<siliceParser::OutputsContext *>(io->outputs());
     if (input) {
       t_inout_nfo io;
       gatherInputNfo(input, io, _current, _context);
@@ -2971,6 +3034,8 @@ void Algorithm::gatherIOs(siliceParser::InOutListContext* inout, t_combinational
       m_InOutNames.insert(make_pair(io.name, (int)m_InOuts.size() - 1));
     } else if (iodef) {
       gatherIoDef(iodef,_current,_context);
+    } else if (allouts) {
+      gatherAllOutputsNfo(allouts, _current, _context);
     } else {
       // symbol, ignore
     }
@@ -3564,9 +3629,11 @@ bool Algorithm::doesNotCallSubroutines() const
 
 bool Algorithm::requiresNoReset() const
 {
+  // has an FSM?
   if (!hasNoFSM()) {
     return false;
   }
+  // has var or outputs with init?
   for (const auto &v : m_Vars) {
     if (v.usage != e_FlipFlop) continue;
     if (!v.do_not_initialize) {
@@ -3576,6 +3643,12 @@ bool Algorithm::requiresNoReset() const
   for (const auto &v : m_Outputs) {
     if (v.usage != e_FlipFlop) continue;
     if (!v.do_not_initialize) {
+      return false;
+    }
+  }
+  // do any of the instantiated algorithms require a reset?
+  for (const auto &I : m_InstancedAlgorithms) {
+    if (!I.second.algo->requiresNoReset()) {
       return false;
     }
   }
@@ -3630,7 +3703,6 @@ void Algorithm::updateAndCheckDependencies(t_vio_dependencies& _depds, antlr4::t
   for (const auto& w : written) {
     _depds.dependencies[w] = upstream;
   }
-
   // -> transport dependencies through algorithm combinational outputs
   for (const auto &alg : m_InstancedAlgorithms) {
     // gather bindings potentially creating comb. cycles
@@ -3682,6 +3754,11 @@ void Algorithm::updateAndCheckDependencies(t_vio_dependencies& _depds, antlr4::t
   /// DEBUG
   if (0) {
     std::cerr << "---- after line " << dynamic_cast<antlr4::ParserRuleContext*>(instr)->getStart()->getLine() << nxl;
+    std::cerr << "written: ";
+    for (auto w : written) {
+      std::cerr << w << ' ';
+    }
+    std::cerr << nxl;
     for (auto w : _depds.dependencies) {
       std::cerr << "var " << w.first << " depds on ";
       for (auto r : w.second) {
@@ -3692,7 +3769,6 @@ void Algorithm::updateAndCheckDependencies(t_vio_dependencies& _depds, antlr4::t
     std::cerr << nxl;
   }
 
-#if 1
   // check if everything is legit
   // for each written variable
   for (const auto& w : written) {
@@ -3731,8 +3807,41 @@ void Algorithm::updateAndCheckDependencies(t_vio_dependencies& _depds, antlr4::t
         }
       }
     }
+    // check if the variable is a dependency of a wire that has been assigned before
+    // -> find wires that depend on this variable
+    for (const auto &a : m_WireAssignments) {
+      auto alw = dynamic_cast<siliceParser::AlwaysAssignedContext *>(a.second.instr);
+      sl_assert(alw != nullptr);
+      sl_assert(alw->IDENTIFIER() != nullptr);
+      // -> determine assigned var
+      string wire = translateVIOName(alw->IDENTIFIER()->getText(), &a.second.block->context);
+      // -> does it depend on written var?
+      if (_depds.dependencies.count(wire) > 0) {
+        if (_depds.dependencies.at(wire).count(w) > 0) {
+          // std::cerr << "wire " << wire << " depends on written " << w << nxl;
+          // yes, check if any other variable depends on this wire
+          for (const auto &d : _depds.dependencies) {
+            if (d.second.count(wire) > 0) {
+              // yes, but maybe that's another wire (which is ok)
+              bool wire_assign = false;
+              if (m_VarNames.count(wire) > 0) {
+                wire_assign = (m_Vars.at(m_VarNames.at(wire)).usage == e_Wire);
+              }
+              if (!wire_assign) {
+                // no: leads to problematic case (ambiguity in final value), error!
+                reportError(
+                  dynamic_cast<antlr4::ParserRuleContext *>(instr)->getSourceInterval(),
+                  (int)(dynamic_cast<antlr4::ParserRuleContext *>(instr)->getStart()->getLine()),
+                  "variable assignement changes the value of a <: tracked expression that was assigned before\n\n(variable: '%s', through tracker '%s' assigned before to '%s').",
+                  w.c_str(), wire.c_str(), d.first.c_str());
+              }
+            }
+          }
+        }
+      }
+    }
   }
-#endif
+
 }
 
 // -------------------------------------------------
@@ -3904,6 +4013,11 @@ void Algorithm::verifyMemberGroup(std::string member, const t_group_definition &
     verifyMemberGroup(member, gd.group, line);
   } else if (gd.intrface != nullptr) {
     verifyMemberInterface(member, gd.intrface, line);
+  } else {
+    std::vector<std::string> mbrs = getGroupMembers(gd);
+    if (std::find(mbrs.begin(), mbrs.end(), member) == mbrs.end()) {
+      reportError(nullptr, line, "group does not contain a member '%s'", member.c_str());
+    }
   }
 }
 
@@ -3923,6 +4037,12 @@ std::vector<std::string> Algorithm::getGroupMembers(const t_group_definition &gd
   } else if (gd.memory != nullptr) {
     const t_mem_nfo &nfo = m_Memories.at(m_MemoryNames.at(gd.memory->name->getText()));
     return nfo.members;
+  } else if (gd.alg != nullptr) {
+    std::vector<std::string> names;
+    for (const auto &o : gd.alg->m_OutputNames) {
+      names.push_back(o.first);
+    }
+    return names;
   }
   return mbs;
 }
@@ -4318,12 +4438,12 @@ void Algorithm::determineOutOfPipelineAssignments(
 
 // -------------------------------------------------
 
-void Algorithm::determineVariablesAndOutputsAccess(
+void Algorithm::determineAccess(
   antlr4::tree::ParseTree             *instr,
   const t_combinational_block_context *context,
-  std::unordered_set<std::string>& _already_written,
-  std::unordered_set<std::string>& _in_vars_read,
-  std::unordered_set<std::string>& _out_vars_written
+  std::unordered_set<std::string>&   _already_written,
+  std::unordered_set<std::string>&   _in_vars_read,
+  std::unordered_set<std::string>&   _out_vars_written
   )
 {
   std::unordered_set<std::string> read;
@@ -4361,7 +4481,7 @@ void Algorithm::determineVariablesAndOutputsAccess(
 
 // -------------------------------------------------
 
-void Algorithm::determineVariablesAndOutputsAccess(t_combinational_block *block)
+void Algorithm::determineAccess(t_combinational_block *block)
 {
   // determine variable access
   std::unordered_set<std::string> already_written;
@@ -4376,7 +4496,7 @@ void Algorithm::determineVariablesAndOutputsAccess(t_combinational_block *block)
     instr.push_back(block->while_loop()->test);
   }
   for (const auto& i : instr) {
-    determineVariablesAndOutputsAccess(i.instr, &block->context, already_written, block->in_vars_read, block->out_vars_written);
+    determineAccess(i.instr, &block->context, already_written, block->in_vars_read, block->out_vars_written);
   }
 }
 
@@ -4419,7 +4539,7 @@ void Algorithm::updateAccessFromBinding(const t_binding_nfo &b,
 
 // -------------------------------------------------
 
-void Algorithm::determineVariablesAndOutputsAccessForWires(
+void Algorithm::determineAccessForWires(
   std::unordered_set<std::string> &_global_in_read,
   std::unordered_set<std::string> &_global_out_written
 ) {
@@ -4429,7 +4549,8 @@ void Algorithm::determineVariablesAndOutputsAccessForWires(
   for (const auto &v : m_Vars) {
     if (v.usage == e_Wire) { // this is a wire (bound expression)
       // find corresponding wire assignement
-      const auto& wa = m_WireAssignments.at(v.name);
+      int wai        = m_WireAssignmentNames.at(v.name);
+      const auto &wa = m_WireAssignments[wai].second;
       auto alw = dynamic_cast<siliceParser::AlwaysAssignedContext *>(wa.instr);
       sl_assert(alw != nullptr);
       sl_assert(alw->IDENTIFIER() != nullptr);
@@ -4454,7 +4575,7 @@ void Algorithm::determineVariablesAndOutputsAccessForWires(
       processed.insert(w);
       // add access based on wire expression
       std::unordered_set<std::string> _,in_read;
-      determineVariablesAndOutputsAccess(all_wires.at(w).instr, &all_wires.at(w).block->context, _, in_read, _global_out_written);
+      determineAccess(all_wires.at(w).instr, &all_wires.at(w).block->context, _, in_read, _global_out_written);
       // foreach read vio
       for (auto v : in_read) {
         // insert in global set
@@ -4474,7 +4595,7 @@ void Algorithm::determineVariablesAndOutputsAccessForWires(
 
 // -------------------------------------------------
 
-void Algorithm::determineVariablesAndOutputsAccess(
+void Algorithm::determineAccess(
   std::unordered_set<std::string>& _global_in_read,
   std::unordered_set<std::string>& _global_out_written
 )
@@ -4484,12 +4605,11 @@ void Algorithm::determineVariablesAndOutputsAccess(
     if (b->state_id == -1 && b->is_state) {
       continue; // block is never reached
     }
-
-    determineVariablesAndOutputsAccess(b);
+    determineAccess(b);
   }
   // determine variable access for always blocks
-  determineVariablesAndOutputsAccess(&m_AlwaysPre);
-  determineVariablesAndOutputsAccess(&m_AlwaysPost);
+  determineAccess(&m_AlwaysPre);
+  determineAccess(&m_AlwaysPost);
   // determine variable access due to algorithm and module instances
   // bindings are considered as belonging to the always pre block
   std::vector<t_binding_nfo> all_bindings;
@@ -4540,7 +4660,7 @@ void Algorithm::determineVariablesAndOutputsAccess(
     }
   }
   // determine variable access for wires
-  determineVariablesAndOutputsAccessForWires(_global_in_read, _global_out_written);
+  determineAccessForWires(_global_in_read, _global_out_written);
   // merge all in_reads and out_written
   auto all_blocks = m_Blocks;
   all_blocks.push_front(&m_AlwaysPre);
@@ -4553,7 +4673,7 @@ void Algorithm::determineVariablesAndOutputsAccess(
 
 // -------------------------------------------------
 
-void Algorithm::determineVariableAndOutputsUsage()
+void Algorithm::determineUsage()
 {
 
   // NOTE The notion of block here ignores combinational chains. For this reason this is only a 
@@ -4563,9 +4683,9 @@ void Algorithm::determineVariableAndOutputsUsage()
   // determine variables access
   std::unordered_set<std::string> global_in_read;
   std::unordered_set<std::string> global_out_written;
-  determineVariablesAndOutputsAccess(global_in_read, global_out_written);
+  determineAccess(global_in_read, global_out_written);
   // set and report
-  const bool report = true;
+  const bool report = false;
   if (report) std::cerr << "---< " << m_Name << "::variables >---" << nxl;
   for (auto& v : m_Vars) {
     if (v.usage != e_Undetermined) {
@@ -4630,30 +4750,6 @@ void Algorithm::determineVariableAndOutputsUsage()
     if (report) std::cerr << nxl;
   }
 
-#if 0
-  /////////// DEBUG
-  for (const auto& v : m_Vars) {
-    cerr << v.name << " access: ";
-    if (v.access & e_ReadOnly) cerr << 'R';
-    if (v.access & e_WriteOnly) cerr << 'W';
-    std::cerr << nxl;
-  }
-  for (const auto& b : all_blocks) {
-    std::cerr << "== block " << b->block_name << "==" << nxl;
-    std::cerr << "   read from before: ";
-    for (auto i : b->in_vars_read) {
-      std::cerr << i << ' ';
-    }
-    std::cerr << nxl;
-    std::cerr << "   changed within: ";
-    for (auto i : b->out_vars_written) {
-      std::cerr << i << ' ';
-    }
-    std::cerr << nxl;
-  }
-  /////////////////
-#endif
-
 }
 
 // -------------------------------------------------
@@ -4664,9 +4760,17 @@ void Algorithm::determineModAlgBoundVIO()
   for (const auto& im : m_InstancedModules) {
     for (const auto& b : im.second.bindings) {
       if (b.dir == e_Right) {
+        // check not already bound
+        if (m_VIOBoundToModAlgOutputs.find(bindingRightIdentifier(b)) != m_VIOBoundToModAlgOutputs.end()) {
+          reportError(nullptr, (int)b.line, "vio '%s' is already bound as the output of another algorithm or module",b.right);
+        }
         // record wire name for this output
         m_VIOBoundToModAlgOutputs[bindingRightIdentifier(b)] = WIRE + im.second.instance_prefix + "_" + b.left;
       } else if (b.dir == e_BiDir) {
+        // check not already bound
+        if (m_VIOBoundToModAlgOutputs.find(bindingRightIdentifier(b)) != m_VIOBoundToModAlgOutputs.end()) {
+          reportError(nullptr, (int)b.line, "vio '%s' is already bound as the output of another algorithm or module", b.right);
+        }
         // record wire name for this inout
         std::string bindpoint = im.second.instance_prefix + "_" + b.left;
         m_ModAlgInOutsBoundToVIO[bindpoint] = bindingRightIdentifier(b);
@@ -4677,9 +4781,17 @@ void Algorithm::determineModAlgBoundVIO()
   for (const auto& ia : m_InstancedAlgorithms) {
     for (const auto& b : ia.second.bindings) {
       if (b.dir == e_Right) {
+        // check not already bound
+        if (m_VIOBoundToModAlgOutputs.find(bindingRightIdentifier(b)) != m_VIOBoundToModAlgOutputs.end()) {
+          reportError(nullptr, (int)b.line, "vio '%s' is already bound as the output of another algorithm or module", b.right);
+        }
         // record wire name for this output
         m_VIOBoundToModAlgOutputs[bindingRightIdentifier(b)] = WIRE + ia.second.instance_prefix + "_" + b.left;
       } else if (b.dir == e_BiDir) {
+        // check not already bound
+        if (m_VIOBoundToModAlgOutputs.find(bindingRightIdentifier(b)) != m_VIOBoundToModAlgOutputs.end()) {
+          reportError(nullptr, (int)b.line, "vio '%s' is already bound as the output of another algorithm or module", b.right);
+        }
         // record wire name for this inout
         std::string bindpoint = ia.second.instance_prefix + "_" + b.left;
         m_ModAlgInOutsBoundToVIO[bindpoint] = bindingRightIdentifier(b);
@@ -4735,6 +4847,7 @@ Algorithm::Algorithm(
   std::string clock, std::string reset, 
   bool autorun, bool onehot,
   const std::unordered_map<std::string, AutoPtr<Module> >&                 known_modules,
+  const std::unordered_map<std::string, AutoPtr<Algorithm> >&              known_algorithms,
   const std::unordered_map<std::string, siliceParser::SubroutineContext*>& known_subroutines,
   const std::unordered_map<std::string, siliceParser::CircuitryContext*>&  known_circuitries,
   const std::unordered_map<std::string, siliceParser::GroupContext*>&      known_groups,
@@ -4743,9 +4856,9 @@ Algorithm::Algorithm(
 )
   : m_Name(name), m_Clock(clock), m_Reset(reset), 
     m_AutoRun(autorun), m_OneHot(onehot), 
-  m_KnownModules(known_modules), m_KnownSubroutines(known_subroutines), 
-  m_KnownCircuitries(known_circuitries), m_KnownGroups(known_groups), 
-  m_KnownInterfaces(known_interfaces), m_KnownBitFields(known_bitfield)
+    m_KnownModules(known_modules), m_KnownAlgorithms(known_algorithms),
+    m_KnownSubroutines(known_subroutines),m_KnownCircuitries(known_circuitries), 
+    m_KnownGroups(known_groups), m_KnownInterfaces(known_interfaces), m_KnownBitFields(known_bitfield)
 {
   // init with empty always blocks
   m_AlwaysPre.id = -1;
@@ -5018,16 +5131,21 @@ void Algorithm::lint(const t_instantiation_context &ictx)
 
 void Algorithm::optimize()
 {
-  // generate states
-  generateStates();
-  // check var access permissions
-  checkPermissions();
-  // determine which VIO are assigned to wires
-  determineModAlgBoundVIO();
-  // analyze variables access 
-  determineVariableAndOutputsUsage();
-  // analyze instanced algorithms inputs
-  analyzeInstancedAlgorithmsInputs();
+  if (!m_Optimized) {
+    // NOTE: recalls the algorithm is optimize, as it can be used by multiple instances
+    // this paves the ways to having different optimizations for different instances
+    m_Optimized = true;
+    // generate states
+    generateStates();
+    // check var access permissions
+    checkPermissions();
+    // determine which VIO are assigned to wires
+    determineModAlgBoundVIO();
+    // analyze variables access 
+    determineUsage();
+    // analyze instanced algorithms inputs
+    analyzeInstancedAlgorithmsInputs();
+  }
 }
 
 // -------------------------------------------------
@@ -5140,7 +5258,7 @@ t_type_nfo Algorithm::determineBitfieldAccessTypeAndWidth(const t_combinational_
   // check field definition exists
   auto F = m_KnownBitFields.find(bfaccess->field->getText());
   if (F == m_KnownBitFields.end()) {
-    reportError(bfaccess->getSourceInterval(), (int)bfaccess->getStart()->getLine(), "unkown bitfield '%s'", bfaccess->field->getText().c_str());
+    reportError(bfaccess->getSourceInterval(), (int)bfaccess->getStart()->getLine(), "unknown bitfield '%s'", bfaccess->field->getText().c_str());
   }
   // either identifier or ioaccess
   t_type_nfo packed;
@@ -5414,12 +5532,10 @@ std::tuple<t_type_nfo, int> Algorithm::writeIOAccess(
       } else {
         sl_assert(false); // cannot read from input
       }
-      out << A->second.instance_prefix << "_" << member;
-      // return A->second.algo->m_Inputs[A->second.algo->m_InputNames.at(member)].width;
+      out << A->second.instance_prefix << "_" << member << suffix;
       return A->second.algo->determineVIOTypeWidthAndTableSize(bctx, member, ioaccess->getSourceInterval(), (int)ioaccess->getStart()->getLine());
     } else if (A->second.algo->isOutput(member)) {
-      out << WIRE << A->second.instance_prefix << "_" << member;
-      // return A->second.algo->m_Outputs[A->second.algo->m_OutputNames.at(member)].width;
+      out << WIRE << A->second.instance_prefix << "_" << member << suffix;
       return A->second.algo->determineVIOTypeWidthAndTableSize(bctx, member, ioaccess->getSourceInterval(), (int)ioaccess->getStart()->getLine());
     } else {
       sl_assert(false);
@@ -5480,7 +5596,7 @@ void Algorithm::writeBitfieldAccess(std::string prefix, std::ostream& out, bool 
   // find field definition
   auto F = m_KnownBitFields.find(bfaccess->field->getText());
   if (F == m_KnownBitFields.end()) {
-    reportError(bfaccess->getSourceInterval(), (int)bfaccess->getStart()->getLine(), "unkown bitfield '%s'", bfaccess->field->getText().c_str());
+    reportError(bfaccess->getSourceInterval(), (int)bfaccess->getStart()->getLine(), "unknown bitfield '%s'", bfaccess->field->getText().c_str());
   }
   verifyMemberBitfield(bfaccess->member->getText(), F->second, (int)bfaccess->getStart()->getLine());
   pair<t_type_nfo, int> ow = bitfieldMemberTypeAndOffset(F->second, bfaccess->member->getText());
@@ -5621,24 +5737,23 @@ void Algorithm::writeWireAssignements(
     // update dependencies
     t_vio_dependencies no_dependencies = _dependencies;
     updateAndCheckDependencies(_dependencies, a.second.instr, &a.second.block->context);
-    // we take the opportunity to check that if the wire depends on other wires, they are either all := or all ::=
-    // mixing these two is forbidden, as this quickly leads to confusion without real benefits
-    // ( Note: I encounter a corner-case use for this ... but it would be best resolved with explicit reference to 
-    //         a variable 'at cycle start' (Q) state, e.g. ::a )
-    for (const auto &d : _dependencies.dependencies.at(var)) {
+    // run check on dependencies
+    for (const auto &dep : _dependencies.dependencies.at(var)) {
       // is this dependency a wire?
-      auto W = m_WireAssignments.find(d);
-      if (W != m_WireAssignments.end()) {
-        auto w_alw    = dynamic_cast<siliceParser::AlwaysAssignedContext *>(W->second.instr);
-        bool w_d_or_q = (w_alw->ALWSASSIGNDBL() == nullptr && alw->LDEFINEDBL() == nullptr);
+      auto W = m_WireAssignmentNames.find(dep);
+      if (W != m_WireAssignmentNames.end()) {
+        const auto &wa = m_WireAssignments[W->second].second;
+        auto w_alw    = dynamic_cast<siliceParser::AlwaysAssignedContext *>(wa.instr);
+        bool w_d_or_q = (w_alw->ALWSASSIGNDBL() == nullptr && w_alw->LDEFINEDBL() == nullptr);
         if (d_or_q ^ w_d_or_q) {
-          reportError(alw->getSourceInterval(), (int)alw->getStart()->getLine(), 
-            "inconsistent use of ::= and := between bound expressions (with '%s')",d.c_str());
+          // indicates we are mixing <: and <::, which is in fact useful
+          // issue a warning still?
         }
       }
-      // update usage of dependencies to q
-      // NOTE: could be done only if wire is used ...
-      updateFFUsage(e_Q, true, _ff_usage.ff_usage[d]);
+      // update usage of dependencies to q if q is used
+      if (!d_or_q) {
+        updateFFUsage(e_Q, true, _ff_usage.ff_usage[dep]);
+      }
     }
     if (!d_or_q) {
       // ignore dependencies if reading from Q: we can ignore them safely
@@ -5893,15 +6008,19 @@ void Algorithm::writeFlipFlopDeclarations(std::string prefix, std::ostream& out,
   // state machine index
   if (!hasNoFSM()) {
     if (!m_OneHot) {
-      out << "reg  [" << stateWidth() - 1 << ":0] " FF_D << prefix << ALG_IDX "," FF_Q << prefix << ALG_IDX << ";" << nxl;
+      out << "reg  [" << stateWidth() - 1 << ":0] " FF_D << prefix << ALG_IDX "," FF_Q << prefix << ALG_IDX << " = " << toFSMState(terminationState()) << ";" << nxl;
     } else {
-      out << "reg  [" << maxState() - 1 << ":0] " FF_D << prefix << ALG_IDX "," FF_Q << prefix << ALG_IDX << ";" << nxl;
+      out << "reg  [" << maxState() - 1 << ":0] " FF_D << prefix << ALG_IDX "," FF_Q << prefix << ALG_IDX << " = " << toFSMState(terminationState()) << ";" << nxl;
     }
     // sub-state indices (one-hot)
     for (auto b : m_Blocks) {
       if (b->num_sub_states > 1) {
         out << "reg  [" << width(b->num_sub_states) - 1 << ":0] " FF_D << prefix << b->block_name << '_' << ALG_IDX "," FF_Q << prefix << b->block_name << '_' << ALG_IDX << ";" << nxl;
       }
+    }
+    // autorun
+    if (m_AutoRun) {
+      out << "reg  " << prefix << ALG_AUTORUN << " = 0;" << nxl;
     }
   }
   // state machine caller id (subroutine)
@@ -5919,7 +6038,7 @@ void Algorithm::writeFlipFlopDeclarations(std::string prefix, std::ostream& out,
     const auto &ia = m_InstancedAlgorithms.at(iaiordr);
     // check for call on purely combinational
     if (!ia.algo->hasNoFSM()) {
-      out << "reg  " << ia.instance_prefix + "_" ALG_RUN << "=0;" << nxl;
+      out << "reg  " << ia.instance_prefix + "_" ALG_RUN << " = 0;" << nxl;
     }
   }
 }
@@ -5934,7 +6053,7 @@ void Algorithm::writeVarFlipFlopUpdate(std::string prefix, std::string reset, st
   } else if (v.init_at_startup || v.do_not_initialize) {
     init_cond = "";
   } else if (!hasNoFSM()) {
-    init_cond = reset + (" || !" ALG_INPUT "_" ALG_RUN);
+    init_cond = reset + (" | ~" ALG_INPUT "_" ALG_RUN);
   } else {
     init_cond = reset;
   }
@@ -5958,7 +6077,7 @@ void Algorithm::writeVarFlipFlopUpdate(std::string prefix, std::string reset, st
     sl_assert(v.type_nfo.base_type != Parameterized);
     ForIndex(i, v.table_size) {
       if (!init_cond.empty()) {
-        out << FF_Q << prefix << v.name << "[" << i << "] <= (" << init_cond << ") ? " << v.init_values[i] << " : " << d_var << ';' << nxl;
+        out << FF_Q << prefix << v.name << "[" << i << "] <= (" << init_cond << ") ? " << v.init_values[i] << " : " << d_var << "[" << i << "];" << nxl;
       } else {
         out << FF_Q << prefix << v.name << "[" << i << "] <= " << d_var << "[" << i << "];" << nxl;
       }
@@ -5986,7 +6105,6 @@ void Algorithm::writeFlipFlops(std::string prefix, std::ostream& out, const t_in
   out << "always @(posedge " << clock << ") begin" << nxl;
 
   // determine var reset condition
-  std::string init_cond;
   std::string reset = m_Reset;
   if (m_Reset != ALG_RESET) {
     // in this case, reset has to be bound to a module/algorithm output
@@ -5997,10 +6115,6 @@ void Algorithm::writeFlipFlops(std::string prefix, std::ostream& out, const t_in
     }
     reset = R->second;
   }
-  init_cond = reset;
-  if (!hasNoFSM()) {
-    init_cond  = init_cond + (" || !" ALG_INPUT "_" ALG_RUN);
-  }
   for (const auto &v : m_Vars) {
     if (v.usage != e_FlipFlop) continue;
     writeVarFlipFlopUpdate(prefix, reset, out, ictx, v);
@@ -6010,13 +6124,18 @@ void Algorithm::writeFlipFlops(std::string prefix, std::ostream& out, const t_in
     writeVarFlipFlopUpdate(prefix, reset, out, ictx, v);
   }
   if (!hasNoFSM()) {
+    std::string init_cond = reset + (" | ~" ALG_INPUT "_" ALG_RUN);
     // state machine index
-    out << FF_Q << prefix << ALG_IDX " <= (" << init_cond << ") ? "
-      << "( ~" << reset << " ? " << toFSMState(entryState()) << " : "
-      << (m_AutoRun ? toFSMState(entryState()) : toFSMState(terminationState()))
-      << ") "
-      << " : " << FF_D << prefix << ALG_IDX 
-      << ";" << nxl;
+    out << FF_Q << prefix << ALG_IDX " <= " << reset << " ? " << toFSMState(terminationState()) << " : ";
+    if (m_AutoRun) {
+        out << "( ~" << prefix << ALG_AUTORUN << " ? " << toFSMState(entryState());
+    } else {
+        out << "( ~" << ALG_INPUT "_" ALG_RUN << " ? " << toFSMState(entryState());
+    }
+    out << " : " << FF_D << prefix << ALG_IDX  << ");" << nxl;
+    if (m_AutoRun) {
+      out << prefix << ALG_AUTORUN << " <= " << reset << " ? 0 : 1;" << nxl;
+    }
     // sub-states indices
     for (auto b : m_Blocks) {
       if (b->num_sub_states > 1) {
@@ -6168,7 +6287,8 @@ void Algorithm::writeCombinationalAlwaysPre(
 
   // always block
   std::queue<size_t> q;
-  writeStatelessBlockGraph(prefix, out, ictx, &m_AlwaysPre, nullptr, q, _always_dependencies, _ff_usage, _post_dependencies);
+  std::set<v2i> lines;
+  writeStatelessBlockGraph(prefix, out, ictx, &m_AlwaysPre, nullptr, q, _always_dependencies, _ff_usage, _post_dependencies, lines);
   clearNoLatchFFUsage(_ff_usage);
 }
 
@@ -6222,24 +6342,13 @@ void Algorithm::writeCombinationalStates(
     } else {
       out << FF_Q << prefix << ALG_IDX << '[' << b->state_id << "]: begin" << nxl;
     }
-    // FSM report
-    if (m_FSMReportEnable) {
-      std::ofstream freport(m_FSMReportName, std::ios_base::app);
-      ExpressionLinter lint(this, ictx);
-      freport << m_Name << " ";
-      freport << (m_OneHot ? b->state_id : toFSMState(b->state_id)) << " ";
-      auto tk = lint.getToken(b->source_interval);
-      if (tk) {
-        std::pair<std::string, int> fl = lint.getTokenSourceFileAndLine(tk);
-        freport << fl.first << " " << fl.second;
-      }
-      freport << nxl;
-    }
+    // track source code lines for reporting
+    set<v2i> lines;
     // if state contains sub-state
     if (b->num_sub_states > 1) {
       // by default stay in this state
       out << FF_D << prefix << ALG_IDX << " = " << b->state_id << ';' << nxl;
-      // produce a local one-hot FSM for the sequence
+      // produce a local FSM for the sequence
       // out << "(* parallel_case, full_case *)" << nxl;
       // out << "case (1'b1)" << nxl;
       out << "case (" << FF_Q << prefix << b->block_name << '_' << ALG_IDX << ")" << nxl;
@@ -6250,15 +6359,15 @@ void Algorithm::writeCombinationalStates(
         // -> case value
         //out << FF_Q << prefix << b->block_name << '_' << ALG_IDX << '[' << cur->sub_state_id << ']'
         out << cur->sub_state_id
-            << ": begin" << nxl;
+          << ": begin" << nxl;
         // -> track dependencies, starting with those of always block
         t_vio_dependencies depds = always_dependencies;
         // -> write block instructions
         ff_usages.push_back(_ff_usage);
-        writeStatelessBlockGraph(prefix, out, ictx, cur, nullptr, q, depds, ff_usages.back(), _post_dependencies);
+        writeStatelessBlockGraph(prefix, out, ictx, cur, nullptr, q, depds, ff_usages.back(), _post_dependencies, lines);
         clearNoLatchFFUsage(ff_usages.back());
         // -> goto next
-        if (cur->sub_state_id == b->num_sub_states-1) { 
+        if (cur->sub_state_id == b->num_sub_states - 1) {
           // -> if last, reinit local index
           // out << FF_D << prefix << b->block_name << '_' << ALG_IDX " = " << b->num_sub_states << "'b1";
           out << FF_D << prefix << b->block_name << '_' << ALG_IDX " = " << "0";
@@ -6272,7 +6381,7 @@ void Algorithm::writeCombinationalStates(
         }
         out << ';' << nxl;
         // -> close state
-        out << "end" << nxl;               
+        out << "end" << nxl;
 #if 0
         /// DEBUG
         for (auto ff : ff_usages.back().ff_usage) {
@@ -6287,7 +6396,7 @@ void Algorithm::writeCombinationalStates(
         }
 #endif        
         // keep going
-        std::set<t_combinational_block*> leaves;
+        std::set<t_combinational_block *> leaves;
         findNonCombinationalLeaves(cur, leaves);
         ++sanity;
         if (leaves.size() == 1) {
@@ -6308,9 +6417,9 @@ void Algorithm::writeCombinationalStates(
       t_vio_dependencies depds = always_dependencies;
       // write block instructions
       ff_usages.push_back(_ff_usage);
-      writeStatelessBlockGraph(prefix, out, ictx, b, nullptr, q, depds, ff_usages.back(), _post_dependencies);
+      writeStatelessBlockGraph(prefix, out, ictx, b, nullptr, q, depds, ff_usages.back(), _post_dependencies, lines);
       clearNoLatchFFUsage(ff_usages.back());
-#if 0      
+#if 0
       /// DEBUG
       for (auto ff : ff_usages.back().ff_usage) {
         out << "// " << ff.first << " ";
@@ -6326,6 +6435,21 @@ void Algorithm::writeCombinationalStates(
     }
     // close state
     out << "end" << nxl;
+    // FSM report
+    if (m_ReportingEnabled) {
+      std::ofstream freport(fsmReportName(), std::ios_base::app);
+      freport << (ictx.instance_name.empty() ? "__main" : ictx.instance_name) << " ";
+      freport << (m_OneHot ? b->state_id : toFSMState(b->state_id)) << " ";
+      freport << ' ' << lines.size() << ' ';
+      for (auto l : lines) {
+        if (l[0] == l[1]) {
+          freport << l[0] << " ";
+        } else {
+          freport << l[0] << ',' << l[1] << " ";
+        }
+      }
+      freport << nxl;
+    }
   }
   // combine all ff usages
   combineFFUsageInto(nullptr,_ff_usage, ff_usages, _ff_usage);
@@ -6338,7 +6462,7 @@ void Algorithm::writeCombinationalStates(
   // default: internal error, should never happen
   {
     out << "default: begin " << nxl;
-    out << FF_D << prefix << ALG_IDX " = " << (m_AutoRun ? toFSMState(entryState()) : toFSMState(terminationState())) << ";" << nxl;
+    out << FF_D << prefix << ALG_IDX " = {" << stateWidth() << "{1'bx}};" << nxl;
     out << " end" << nxl;
   }
   out << "endcase" << nxl;
@@ -6346,7 +6470,22 @@ void Algorithm::writeCombinationalStates(
 
 // -------------------------------------------------
 
-void Algorithm::writeBlock(std::string prefix, std::ostream &out, const t_instantiation_context &ictx, const t_combinational_block *block, t_vio_dependencies &_dependencies, t_vio_ff_usage &_ff_usage) const
+v2i Algorithm::instructionLines(antlr4::tree::ParseTree *instr, const t_instantiation_context &ictx) const
+{
+  ExpressionLinter lint(this, ictx);
+  auto tk_start = lint.getToken(instr->getSourceInterval(), false);
+  auto tk_end = lint.getToken(instr->getSourceInterval(), true);
+  if (tk_start && tk_end) {
+    std::pair<std::string, int> fl_start = lint.getTokenSourceFileAndLine(tk_start);
+    std::pair<std::string, int> fl_end = lint.getTokenSourceFileAndLine(tk_end);
+    return v2i(fl_start.second, fl_end.second);
+  }
+  return v2i(-1);
+}
+
+// -------------------------------------------------
+
+void Algorithm::writeBlock(std::string prefix, std::ostream &out, const t_instantiation_context &ictx, const t_combinational_block *block, t_vio_dependencies &_dependencies, t_vio_ff_usage &_ff_usage, std::set<v2i>& _lines) const
 {
   out << "// " << block->block_name;
   if (block->context.subroutine) {
@@ -6360,6 +6499,13 @@ void Algorithm::writeBlock(std::string prefix, std::ostream &out, const t_instan
     out << "// --" << nxl;
   }
   for (const auto &a : block->instructions) {
+    // add to lines
+    if (m_ReportingEnabled) {
+      v2i lns = instructionLines(a.instr, ictx);
+      if (lns != v2i(-1)) {
+        _lines.insert(lns);
+      }
+    }
     // write instruction
     {
       auto assign = dynamic_cast<siliceParser::AssignmentContext *>(a.instr);
@@ -6508,7 +6654,8 @@ void Algorithm::writeStatelessBlockGraph(
   std::queue<size_t>& _q, 
   t_vio_dependencies& _dependencies, 
   t_vio_ff_usage&     _ff_usage, 
-  t_vio_dependencies& _post_dependencies) const
+  t_vio_dependencies& _post_dependencies,
+  std::set<v2i> &_lines) const
 {
   // recursive call?
   if (stop_at != nullptr) {
@@ -6521,7 +6668,7 @@ void Algorithm::writeStatelessBlockGraph(
       mergeDependenciesInto(_dependencies, _post_dependencies);
       return;
     }
-    // if called on a sub-state, no nothing but stop here
+    // if called on a sub-state, do nothing but stop here
     if (block->is_sub_state) {
       mergeDependenciesInto(_dependencies, _post_dependencies);
       return;
@@ -6531,23 +6678,30 @@ void Algorithm::writeStatelessBlockGraph(
   const t_combinational_block *current = block;
   while (true) {
     // write current block
-    writeBlock(prefix, out, ictx, current, _dependencies, _ff_usage);
+    writeBlock(prefix, out, ictx, current, _dependencies, _ff_usage, _lines);
     // merge 
     // goto next in chain
     if (current->next()) {
       current = current->next()->next;
     } else if (current->if_then_else()) {
-      out << "if (" << rewriteExpression(prefix, current->if_then_else()->test.instr, current->if_then_else()->test.__id, &current->context, FF_Q, true, _dependencies, _ff_usage) << ") begin" << nxl;
       vector<t_vio_ff_usage> usage_branches;
+      out << "if (" << rewriteExpression(prefix, current->if_then_else()->test.instr, current->if_then_else()->test.__id, &current->context, FF_Q, true, _dependencies, _ff_usage) << ") begin" << nxl;
+      // add to lines
+      if (m_ReportingEnabled) {
+        v2i lns = instructionLines(current->if_then_else()->test.instr, ictx);
+        if (lns != v2i(-1)) {
+          _lines.insert(lns);
+        }
+      }
       // recurse if
       t_vio_dependencies depds_if = _dependencies; 
       usage_branches.push_back(_ff_usage/*t_vio_ff_usage()*/);
-      writeStatelessBlockGraph(prefix, out, ictx, current->if_then_else()->if_next, current->if_then_else()->after, _q, depds_if, usage_branches.back(), _post_dependencies);
+      writeStatelessBlockGraph(prefix, out, ictx, current->if_then_else()->if_next, current->if_then_else()->after, _q, depds_if, usage_branches.back(), _post_dependencies, _lines);
       out << "end else begin" << nxl;
       // recurse else
       t_vio_dependencies depds_else = _dependencies;
       usage_branches.push_back(_ff_usage/*t_vio_ff_usage()*/);
-      writeStatelessBlockGraph(prefix, out, ictx, current->if_then_else()->else_next, current->if_then_else()->after, _q, depds_else, usage_branches.back(), _post_dependencies);
+      writeStatelessBlockGraph(prefix, out, ictx, current->if_then_else()->else_next, current->if_then_else()->after, _q, depds_else, usage_branches.back(), _post_dependencies, _lines);
       out << "end" << nxl;
       // merge dependencies
       mergeDependenciesInto(depds_if, _dependencies);
@@ -6573,12 +6727,19 @@ void Algorithm::writeStatelessBlockGraph(
         bool isidentifier = isIdentifier(current->switch_case()->test.instr, identifier);
         if (!isidentifier) { throw Fatal("internal error (onehot switch)"); }
       }
+      // add to lines
+      if (m_ReportingEnabled) {
+        v2i lns = instructionLines(current->switch_case()->test.instr, ictx);
+        if (lns != v2i(-1)) {
+          _lines.insert(lns);
+        }
+      }
       // recurse block
       t_vio_dependencies depds_before_case = _dependencies;
       vector<t_vio_ff_usage> usage_branches;
       bool has_default = false;
       for (auto cb : current->switch_case()->case_blocks) {
-        if (current->switch_case()->onehot) {
+        if (current->switch_case()->onehot && cb.first != "default") {
           out << "  "
             << rewriteIdentifier(prefix, identifier, "", &current->context, -1, FF_Q, true, _dependencies, _ff_usage)
             << "[" << cb.first << "]: begin" << nxl;
@@ -6590,7 +6751,7 @@ void Algorithm::writeStatelessBlockGraph(
         // recurse case
         t_vio_dependencies depds_case = depds_before_case;
         usage_branches.push_back(_ff_usage/*t_vio_ff_usage()*/);
-        writeStatelessBlockGraph(prefix, out, ictx, cb.second, current->switch_case()->after, _q, depds_case, usage_branches.back(), _post_dependencies);
+        writeStatelessBlockGraph(prefix, out, ictx, cb.second, current->switch_case()->after, _q, depds_case, usage_branches.back(), _post_dependencies, _lines);
         // merge sets of written vars
         mergeDependenciesInto(depds_case, _dependencies);
         out << "  end" << nxl;
@@ -6598,17 +6759,16 @@ void Algorithm::writeStatelessBlockGraph(
       // end of case
       out << "endcase" << nxl;
       // checks
-      if (has_default && current->switch_case()->onehot) {
-        reportError(current->source_interval, -1, "onehot switch case should not have a default");
-      }
       if (current->switch_case()->onehot) {
-        string var = translateVIOName(identifier,&current->context);
-        bool found = false;
-        auto def = getVIODefinition(var, found);
-        if (found) {
-          int width = atoi(varBitWidth(def, ictx).c_str());
-          if (current->switch_case()->case_blocks.size() != width) {
-            reportError(current->source_interval, -1, "onehot switch case does not have the correct number of entries\n     (%s is %d bits wide, expecting %d entries, found %d)",var.c_str(),width,width, current->switch_case()->case_blocks.size());
+        if (!has_default) {
+          string var = translateVIOName(identifier, &current->context);
+          bool found = false;
+          auto def = getVIODefinition(var, found);
+          if (found) {
+            int width = atoi(varBitWidth(def, ictx).c_str());
+            if (current->switch_case()->case_blocks.size() != width) {
+              reportError(current->source_interval, -1, "onehot switch case without default does not have the correct number of entries\n     (%s is %d bits wide, expecting %d entries, found %d)", var.c_str(), width, width, current->switch_case()->case_blocks.size());
+            }
           }
         }
       }
@@ -6628,12 +6788,19 @@ void Algorithm::writeStatelessBlockGraph(
     } else if (current->while_loop()) {
       // while
       out << "if (" << rewriteExpression(prefix, current->while_loop()->test.instr, current->while_loop()->test.__id, &current->context, FF_Q, true, _dependencies, _ff_usage) << ") begin" << nxl;
-      writeStatelessBlockGraph(prefix, out, ictx, current->while_loop()->iteration, current->while_loop()->after, _q, _dependencies, _ff_usage, _post_dependencies);
+      writeStatelessBlockGraph(prefix, out, ictx, current->while_loop()->iteration, current->while_loop()->after, _q, _dependencies, _ff_usage, _post_dependencies, _lines);
       out << "end else begin" << nxl;
       out << FF_D << prefix << ALG_IDX " = " << toFSMState(fastForward(current->while_loop()->after)->state_id) << ";" << nxl;
       pushState(current->while_loop()->after, _q);
       out << "end" << nxl;
       mergeDependenciesInto(_dependencies, _post_dependencies);
+      // add to lines
+      if (m_ReportingEnabled) {
+        v2i lns = instructionLines(current->while_loop()->test.instr, ictx);
+        if (lns != v2i(-1)) {
+          _lines.insert(lns);
+        }
+      }
       return;
     } else if (current->return_from()) {
       // return to caller (goes to termination of algorithm is not set)
@@ -6710,7 +6877,7 @@ void Algorithm::writeStatelessBlockGraph(
       return;
     } else if (current->pipeline_next()) {
       // write pipeline
-      current = writeStatelessPipeline(prefix, out, ictx, current, _q, _dependencies, _ff_usage, _post_dependencies);
+      current = writeStatelessPipeline(prefix, out, ictx, current, _q, _dependencies, _ff_usage, _post_dependencies, _lines);
     } else { 
       // necessary as m_AlwaysPre/m_AlwaysPost reaches this
       if (block != &m_AlwaysPre && block != &m_AlwaysPost) {
@@ -6753,7 +6920,8 @@ const Algorithm::t_combinational_block *Algorithm::writeStatelessPipeline(
   std::queue<size_t>& _q, 
   t_vio_dependencies& _dependencies, 
   t_vio_ff_usage&     _ff_usage,
-  t_vio_dependencies& _post_dependencies) const
+  t_vio_dependencies& _post_dependencies,
+  std::set<v2i>&      _lines) const
 {
   // follow the chain
   out << "// pipeline" << nxl;
@@ -6782,10 +6950,10 @@ const Algorithm::t_combinational_block *Algorithm::writeStatelessPipeline(
     */
     // write code
     if (current != after) { // this is the more complex case of multiple blocks in stage
-      writeStatelessBlockGraph(prefix, out, ictx, current, after, _q, deps, _ff_usage, _post_dependencies); // NOTE: q will not be changed since this is a combinational block
+      writeStatelessBlockGraph(prefix, out, ictx, current, after, _q, deps, _ff_usage, _post_dependencies, _lines); // NOTE: q will not be changed since this is a combinational block
       current = after;
     } else {
-      writeBlock(prefix, out, ictx, current, deps, _ff_usage);
+      writeBlock(prefix, out, ictx, current, deps, _ff_usage, _lines);
     }
     clearNoLatchFFUsage(_ff_usage);
     // trickle vars: start
@@ -6930,7 +7098,7 @@ void Algorithm::writeModuleMemory(std::string instance_name, std::ostream& out, 
   case BROM:           base = "brom_template"; break;
   case DUALBRAM:       base = "dualport_bram_template"; break;
   case SIMPLEDUALBRAM: base = "simple_dualport_bram_template"; break;
-  default: throw Fatal("internal error (unkown memory type)"); break;
+  default: throw Fatal("internal error (unknown memory type)"); break;
   }
   // load template
   VerilogTemplate tmplt;
@@ -6947,22 +7115,21 @@ void Algorithm::writeModuleMemory(std::string instance_name, std::ostream& out, 
 void Algorithm::writeAsModule(std::string instance_name, std::ostream &out)
 {
   t_instantiation_context ictx; // empty instantiation context
+  ictx.instance_name = instance_name;
   m_TopMost = true; // this is the topmost
-  if (!m_VIOReportName.empty()) {
-    // create report file, will delete if existing
-    std::ofstream freport(m_VIOReportName);
+  if (!m_ReportBaseName.empty()) {
+    // create report files, will delete if existing
+    std::ofstream freport_a(algReportName());
+    std::ofstream freport_v(vioReportName());
+    std::ofstream freport_f(fsmReportName());
   }
-  if (!m_FSMReportName.empty()) {
-    // create report file, will delete if existing
-    std::ofstream freport(m_FSMReportName);
-  }
-  writeAsModule(instance_name, out, ictx, true);
-  writeAsModule(instance_name, out, ictx, false);
+  writeAsModule(out, ictx, true);
+  writeAsModule(out, ictx, false);
 }
 
 // -------------------------------------------------
 
-void Algorithm::writeAsModule(std::string instance_name, std::ostream &out, const t_instantiation_context &ictx, bool first_pass)
+void Algorithm::writeAsModule(std::ostream &out, const t_instantiation_context &ictx, bool first_pass)
 {
   if (first_pass) {
 
@@ -6970,15 +7137,31 @@ void Algorithm::writeAsModule(std::string instance_name, std::ostream &out, cons
 
     // lint upon instantiation
     lint(ictx);
+    // optimize
+    optimize();
 
-    // activate FSM report?
-    m_FSMReportEnable = (!m_FSMReportName.empty());
+    // activate reporting?
+    m_ReportingEnabled = (!m_ReportBaseName.empty());
+    if (m_ReportingEnabled) {
+      // algorithm report
+      ExpressionLinter linter(this, ictx);
+      std::ofstream freport(algReportName(), std::ios_base::app);
+      sl_assert(!m_Blocks.empty());
+      auto tk = linter.getToken(m_Blocks.front()->source_interval);
+      if (tk) {
+        std::pair<std::string, int> fl = linter.getTokenSourceFileAndLine(tk);
+        freport 
+          << (ictx.instance_name.empty() ? "__main" : ictx.instance_name) << " " 
+          << (ictx.local_instance_name.empty() ? "main" : ictx.local_instance_name) << " " 
+          << m_Name << " " << fl.first << nxl;
+      }
+    }
 
     // first pass, discarded but used to fine tune detection of temporary VIOs
     {
       t_vio_ff_usage ff_usage;
       std::ofstream null;
-      writeAsModule(instance_name, null, ictx, ff_usage, first_pass);
+      writeAsModule(null, ictx, ff_usage, first_pass);
 
       // update usage based on first pass
       for (const auto &v : ff_usage.ff_usage) {
@@ -6995,9 +7178,17 @@ void Algorithm::writeAsModule(std::string instance_name, std::ostream &out, cons
             }
           }
           if (hasNoFSM()) {
-            // if there is no FSM, the algorithm is combinational and outputs do not need to be latched
+            // if there is no FSM, the algorithm is combinational and outputs do not need to be registered
             if (m_OutputNames.count(v.first)) {
               if (m_Outputs.at(m_OutputNames.at(v.first)).usage == e_FlipFlop) {
+                m_Outputs.at(m_OutputNames.at(v.first)).usage = e_Temporary;
+              }
+            }
+          } else {
+            // check if combinational output can be turned into a temporary
+            if (m_OutputNames.count(v.first)) {
+              if ( m_Outputs.at(m_OutputNames.at(v.first)).usage == e_FlipFlop 
+                && m_Outputs.at(m_OutputNames.at(v.first)).combinational) {
                 m_Outputs.at(m_OutputNames.at(v.first)).usage = e_Temporary;
               }
             }
@@ -7026,13 +7217,15 @@ void Algorithm::writeAsModule(std::string instance_name, std::ostream &out, cons
     /// second pass, now that VIO usage is refined
 
     // turn reporting off in second pass
-    m_FSMReportEnable = false;
+    m_ReportingEnabled = false;
 
     t_vio_ff_usage ff_usage;
-    writeAsModule(instance_name, out, ictx, ff_usage, first_pass);
+    writeAsModule(out, ictx, ff_usage, first_pass);
 
     // output VIO report (if enabled)
-    outputVIOReport(instance_name, ictx);
+    if (!m_ReportBaseName.empty()) {
+      outputVIOReport(ictx);
+    }
 
   }
 
@@ -7064,13 +7257,15 @@ bool Algorithm::getVIONfo(std::string vio, t_var_nfo& _nfo) const
 
 // -------------------------------------------------
 
-void Algorithm::writeAsModule(std::string instance_name,ostream& out, const t_instantiation_context& ictx, t_vio_ff_usage& _ff_usage, bool first_pass) const
+void Algorithm::writeAsModule(ostream& out, const t_instantiation_context& ictx, t_vio_ff_usage& _ff_usage, bool first_pass) const
 {
   out << nxl;
 
+  t_vio_ff_usage ff_input_bindings_usage;
+
   // write memory modules
   for (const auto& mem : m_Memories) {
-    writeModuleMemory(instance_name, out, mem);
+    writeModuleMemory(ictx.instance_name, out, mem);
   }
 
   // write instantiated algorithms
@@ -7105,11 +7300,13 @@ void Algorithm::writeAsModule(std::string instance_name,ostream& out, const t_in
       local_ictx.parameters[str_signed] = typeString(varType(bnfo,ictx));
     }
     // -> write instance
-    nfo.algo->writeAsModule(instance_name + "_" + nfo.instance_name, out, local_ictx, first_pass);
+    local_ictx.instance_name = ictx.instance_name + "_" + nfo.instance_name;
+    local_ictx.local_instance_name = nfo.instance_name;
+    nfo.algo->writeAsModule(out, local_ictx, first_pass);
   }
 
   // module header
-  out << "module M_" << m_Name + (instance_name.empty() ? "" : ("_" + instance_name)) + ' ';
+  out << "module M_" << m_Name + (ictx.instance_name.empty() ? "" : ("_" + ictx.instance_name)) + ' ';
 
   // list ports names
   out << '(' << nxl;
@@ -7159,7 +7356,7 @@ void Algorithm::writeAsModule(std::string instance_name,ostream& out, const t_in
   {
     t_vio_dependencies _1, _2;
     out << "assign out_" ALG_CLOCK << " = " 
-      << rewriteIdentifier("_", m_Clock, "", nullptr, -1, FF_Q, true, _1, _ff_usage) 
+      << rewriteIdentifier("_", m_Clock, "", nullptr, -1, FF_Q, true, _1, ff_input_bindings_usage)
       << ';' << nxl;
   }
 
@@ -7242,23 +7439,27 @@ void Algorithm::writeAsModule(std::string instance_name,ostream& out, const t_in
       out << (v.combinational ? FF_D : FF_Q);
       out << "_" << v.name << ';' << nxl;
       if (v.combinational) {
-        updateFFUsage(e_D, true, _ff_usage.ff_usage[v.name]);
+        updateFFUsage(e_D, true, ff_input_bindings_usage.ff_usage[v.name]);
       } else {
-        updateFFUsage(e_Q, true, _ff_usage.ff_usage[v.name]);
+        updateFFUsage(e_Q, true, ff_input_bindings_usage.ff_usage[v.name]);
       }
     } else if (v.usage == e_Temporary) {
         out << "assign " << ALG_OUTPUT << "_" << v.name << " = " << FF_TMP << "_" << v.name << ';' << nxl;
     } else if (v.usage == e_Bound) {
         out << "assign " << ALG_OUTPUT << "_" << v.name << " = " << m_VIOBoundToModAlgOutputs.at(v.name) << ';' << nxl;
     } else {
-      throw Fatal("internal error (output assigments)");
+      throw Fatal("internal error (output assignments)");
     }
   }
 
   // algorithm done
   if (!hasNoFSM()) {
     // track whenever algorithm reaches termination
-    out << "assign " << ALG_OUTPUT << "_" << ALG_DONE << " = (" << FF_Q << "_" << ALG_IDX << " == " << toFSMState(terminationState()) << ");" << nxl;
+    if (m_AutoRun) {
+      out << "assign " << ALG_OUTPUT << "_" << ALG_DONE << " = (" << FF_Q << "_" << ALG_IDX << " == " << toFSMState(terminationState()) << ") & _" << ALG_AUTORUN << ";" << nxl;
+    } else {
+      out << "assign " << ALG_OUTPUT << "_" << ALG_DONE << " = (" << FF_Q << "_" << ALG_IDX << " == " << toFSMState(terminationState()) << ");" << nxl;
+    }
   } else if (m_TopMost) {
     // a top most always will never be done
     out << "assign " << ALG_OUTPUT << "_" << ALG_DONE << " = 0;" << nxl;
@@ -7285,9 +7486,28 @@ void Algorithm::writeAsModule(std::string instance_name,ostream& out, const t_in
         t_vio_dependencies _;
         out << '.' << b.left << '(';
         out << rewriteIdentifier("_", bindingRightIdentifier(b), "", nullptr, nfo.second.instance_line,
-          b.dir == e_LeftQ ? FF_Q : FF_D, true, _, _ff_usage, e_DQ /*force module inputs to be latched*/
+          b.dir == e_LeftQ ? FF_Q : FF_D, true, _, ff_input_bindings_usage,
+          b.dir == e_LeftQ ?  e_Q : e_D
         );
         out << ")";
+        // check whether the bound variable is a wire, another bound var or an input in which case <:: does not make sense
+        if (b.dir == e_LeftQ) {
+          std::string bid = bindingRightIdentifier(b);
+          const auto &vio = m_VIOBoundToModAlgOutputs.find(bid);
+          bool bound_wire_input = false;
+          if (vio != m_VIOBoundToModAlgOutputs.end()) {
+            bound_wire_input = true;
+          }
+          if (m_WireAssignmentNames.count(bid) > 0) {
+            bound_wire_input = true;
+          }
+          if (isInput(bid)) {
+            bound_wire_input = true;
+          }
+          if (bound_wire_input) {
+            reportError(nullptr, b.line, "using <:: on input, tracked expression or bound vio '%s' has no effect, use <: instead", bid.c_str());
+          }
+        }
       } else if (b.dir == e_Right) {
         // output (wire)
         out << '.' << b.left << '(' << wire_prefix + "_" + b.left << ")";
@@ -7314,7 +7534,7 @@ void Algorithm::writeAsModule(std::string instance_name,ostream& out, const t_in
   for (const auto& iaiordr : m_InstancedAlgorithmsInDeclOrder) {
     const auto &nfo = m_InstancedAlgorithms.at(iaiordr);
     // algorithm module
-    out << "M_" << nfo.algo_name << '_' << instance_name + '_' + nfo.instance_name << ' ';
+    out << "M_" << nfo.algo_name << '_' << ictx.instance_name + '_' + nfo.instance_name << ' ';
     // instance name
     out << nfo.instance_name << ' ';
     // ports
@@ -7326,20 +7546,39 @@ void Algorithm::writeAsModule(std::string instance_name,ostream& out, const t_in
         // input is bound, directly map bound VIO
         t_vio_dependencies _;
         out << rewriteIdentifier("_", nfo.boundinputs.at(is.name).first, "", nullptr, nfo.instance_line, 
-          nfo.boundinputs.at(is.name).second == e_Q ? FF_Q : FF_D, true, _, _ff_usage, 
-          nfo.boundinputs.at(is.name).second == e_Q ? e_Q : (is.nolatch ? e_D : e_DQ /*force inputs to be latched by default*/) );
+          nfo.boundinputs.at(is.name).second == e_Q ? FF_Q : FF_D, true, _, ff_input_bindings_usage,
+          nfo.boundinputs.at(is.name).second == e_Q ?  e_Q : e_D
+        );
+        // check whether the bound variable is a wire or another bound var, in which case <:: does not make sense
+        if (nfo.boundinputs.at(is.name).second == e_Q) {
+          std::string bid = nfo.boundinputs.at(is.name).first;
+          const auto &vio = m_VIOBoundToModAlgOutputs.find(bid);
+          bool bound_wire_input = false;
+          if (vio != m_VIOBoundToModAlgOutputs.end()) {
+            bound_wire_input = true;
+          }
+          if (m_WireAssignmentNames.count(bid) > 0) {
+            bound_wire_input = true;
+          }
+          if (isInput(bid)) {
+            bound_wire_input = true;
+          }
+          if (bound_wire_input) {
+            reportError(nullptr, nfo.instance_line, "using <:: on input, tracked expression or bound vio '%s' has no effect, use <: instead",bid.c_str());
+          }
+        }
       } else {
         // input is not bound and assigned in logic, a specific flip-flop is created for this
         if (nfo.algo->isNotCallable()) {
           // the instance is never called, we bind to D
           out << FF_D << nfo.instance_prefix << "_" << is.name;
           // add to usage
-          updateFFUsage(is.nolatch ? e_D : e_DQ /*force inputs to be latched by default*/, true, _ff_usage.ff_usage[nfo.instance_prefix + "_" + is.name]);
+          updateFFUsage(e_D, true, ff_input_bindings_usage.ff_usage[nfo.instance_prefix + "_" + is.name]);
         } else {
           // the instance is only called, we bind to Q
           out << FF_Q << nfo.instance_prefix << "_" << is.name;
           // add to usage
-          updateFFUsage(e_Q, true, _ff_usage.ff_usage[nfo.instance_prefix + "_" + is.name]);
+          updateFFUsage(e_Q, true, ff_input_bindings_usage.ff_usage[nfo.instance_prefix + "_" + is.name]);
         }
       }
       out << ')' << ',' << nxl;
@@ -7379,12 +7618,12 @@ void Algorithm::writeAsModule(std::string instance_name,ostream& out, const t_in
     // reset
     if (!nfo.algo->requiresNoReset()) {
       t_vio_dependencies _;
-      out << '.' << ALG_RESET << '(' << rewriteIdentifier("_", nfo.instance_reset, "", nullptr, nfo.instance_line, FF_Q, true, _, _ff_usage) << ")," << nxl;
+      out << '.' << ALG_RESET << '(' << rewriteIdentifier("_", nfo.instance_reset, "", nullptr, nfo.instance_line, FF_Q, true, _, ff_input_bindings_usage) << ")," << nxl;
     }
     // clock
     {
       t_vio_dependencies _;
-      out << '.' << ALG_CLOCK << '(' << rewriteIdentifier("_", nfo.instance_clock, "", nullptr, nfo.instance_line, FF_Q, true, _, _ff_usage) << ")" << nxl;
+      out << '.' << ALG_CLOCK << '(' << rewriteIdentifier("_", nfo.instance_clock, "", nullptr, nfo.instance_line, FF_Q, true, _, ff_input_bindings_usage) << ")" << nxl;
     }
     // end of instantiation      
     out << ");" << nxl;
@@ -7394,30 +7633,30 @@ void Algorithm::writeAsModule(std::string instance_name,ostream& out, const t_in
   // memory instantiations (2/2)
   for (const auto& mem : m_Memories) {
     // module
-    out << memoryModuleName(instance_name,mem) << " __mem__" << mem.name << '(' << nxl;
+    out << memoryModuleName(ictx.instance_name,mem) << " __mem__" << mem.name << '(' << nxl;
     // clocks
     if (mem.clocks.empty()) {
       if (mem.mem_type == DUALBRAM || mem.mem_type == SIMPLEDUALBRAM) {
         t_vio_dependencies _1,_2;
-        out << '.' << ALG_CLOCK << "0(" << rewriteIdentifier("_", m_Clock, "", nullptr, mem.line, FF_Q, true, _1, _ff_usage) << ")," << nxl;
-        out << '.' << ALG_CLOCK << "1(" << rewriteIdentifier("_", m_Clock, "", nullptr, mem.line, FF_Q, true, _2, _ff_usage) << ")," << nxl;
+        out << '.' << ALG_CLOCK << "0(" << rewriteIdentifier("_", m_Clock, "", nullptr, mem.line, FF_Q, true, _1, ff_input_bindings_usage) << ")," << nxl;
+        out << '.' << ALG_CLOCK << "1(" << rewriteIdentifier("_", m_Clock, "", nullptr, mem.line, FF_Q, true, _2, ff_input_bindings_usage) << ")," << nxl;
       } else {
         t_vio_dependencies _;
-        out << '.' << ALG_CLOCK << '(' << rewriteIdentifier("_", m_Clock, "", nullptr, mem.line, FF_Q, true, _, _ff_usage) << ")," << nxl;
+        out << '.' << ALG_CLOCK << '(' << rewriteIdentifier("_", m_Clock, "", nullptr, mem.line, FF_Q, true, _, ff_input_bindings_usage) << ")," << nxl;
       }
     } else {
       sl_assert((mem.mem_type == DUALBRAM || mem.mem_type == SIMPLEDUALBRAM) && mem.clocks.size() == 2);
       std::string clk0 = mem.clocks[0];
       std::string clk1 = mem.clocks[1];
       t_vio_dependencies _1, _2;
-      out << '.' << ALG_CLOCK << "0(" << rewriteIdentifier("_", clk0, "", nullptr, mem.line, FF_D, true, _1, _ff_usage) << ")," << nxl;
-      out << '.' << ALG_CLOCK << "1(" << rewriteIdentifier("_", clk1, "", nullptr, mem.line, FF_D, true, _2, _ff_usage) << ")," << nxl;
+      out << '.' << ALG_CLOCK << "0(" << rewriteIdentifier("_", clk0, "", nullptr, mem.line, FF_Q, true, _1, ff_input_bindings_usage) << ")," << nxl;
+      out << '.' << ALG_CLOCK << "1(" << rewriteIdentifier("_", clk1, "", nullptr, mem.line, FF_Q, true, _2, ff_input_bindings_usage) << ")," << nxl;
     }
     // inputs
     for (const auto& inv : mem.in_vars) {
       t_vio_dependencies _;
-      out << '.' << ALG_INPUT << '_' << inv << '(' << rewriteIdentifier("_", inv, "", nullptr, mem.line, mem.delayed ? FF_Q : FF_D, true, _, _ff_usage,
-      mem.delayed ? e_Q : (mem.no_input_latch ? e_D : e_DQ /*latch inputs*/ )
+      out << '.' << ALG_INPUT << '_' << inv << '(' << rewriteIdentifier("_", inv, "", nullptr, mem.line, mem.delayed ? FF_Q : FF_D, true, _, ff_input_bindings_usage,
+        mem.delayed ? e_Q : e_D
       ) << ")," << nxl;
     }
     // output wires
@@ -7434,6 +7673,22 @@ void Algorithm::writeAsModule(std::string instance_name,ostream& out, const t_in
     out << ");" << nxl;
   }
   out << nxl;
+
+  // split the input bindings usage into pre / post
+  // Q are considered read at cycle start ('top' of the cycle circuit)
+  // D are considered read at cycle end   ('bottom' of the cycle circuit)
+  vector<t_vio_ff_usage> post_ff_usage;
+  post_ff_usage.push_back(t_vio_ff_usage());
+  for (auto &v : ff_input_bindings_usage.ff_usage) {
+    if (v.second & e_D) {
+      post_ff_usage.back().ff_usage[v.first] = e_D;
+    } else if (v.second & e_Q) {
+      _ff_usage.ff_usage[v.first] = e_Q; 
+    } else {
+      reportError(nullptr, -1, "internal error, input bindings usage case");
+    }
+  }
+
   // track dependencies
   t_vio_dependencies always_dependencies;
   t_vio_dependencies post_dependencies;
@@ -7456,11 +7711,31 @@ void Algorithm::writeAsModule(std::string instance_name,ostream& out, const t_in
       cerr << std::endl;
     }*/
     std::queue<size_t> q;
+    std::set<v2i>      lines;
     t_vio_dependencies _; // unusued
-    writeStatelessBlockGraph("_", out, ictx, &m_AlwaysPost, nullptr, q, post_dependencies, _ff_usage, _);
+    writeStatelessBlockGraph("_", out, ictx, &m_AlwaysPost, nullptr, q, post_dependencies, _ff_usage, _, lines);
     clearNoLatchFFUsage(_ff_usage);
   }
   out << "end" << nxl;
+
+  combineFFUsageInto(nullptr, _ff_usage, post_ff_usage, _ff_usage);
+
+#if 0
+  std::cerr << " === usage for algorithm " << m_Name << " ====" << nxl;
+  for (const auto &v : _ff_usage.ff_usage) {
+    std::cerr << "vio " << v.first << " : ";
+    if (v.second & e_D) {
+      std::cerr << "D";
+    }
+    if (v.second & e_Q) {
+      std::cerr << "Q";
+    }
+    if (v.second & e_Latch) {
+      std::cerr << "latch";
+    }
+    std::cerr << nxl;
+  }
+#endif
 
   out << "endmodule" << nxl;
   out << nxl;
@@ -7500,59 +7775,89 @@ void Algorithm::outputFSMGraph(std::string dotFile) const
 
 // -------------------------------------------------
 
-void Algorithm::outputVIOReport(
-  std::string instance_name, const t_instantiation_context &ictx) const
+void Algorithm::outputVIOReport(const t_instantiation_context &ictx) const
 {
-  if (m_VIOReportName.empty()) {
-    return;
-  }
-
   ExpressionLinter lint(this, ictx);
 
-  std::ofstream freport(m_VIOReportName, std::ios_base::app);
+  std::ofstream freport(vioReportName(), std::ios_base::app);
 
-  // freport << "====> algorithm " << m_Name << nxl;
+  freport << (ictx.instance_name.empty()?"__main":ictx.instance_name) << " " << (m_Vars.size() + m_Outputs.size() + m_Inputs.size()) << " " << nxl;
   for (auto &v : m_Vars) {
-      auto tk = lint.getToken(v.source_interval);
-      if (tk) {
-        std::pair<std::string, int> fl = lint.getTokenSourceFileAndLine(tk);
-        freport << fl.first << " "
-          << tk->getText() << " "
-          << v.name << " " 
-          << fl.second << " "
-          // << tk->getCharPositionInLine() << ";" << ((int)tk->getCharPositionInLine() + (int)tk->getStopIndex() - (int)tk->getStartIndex()) << " "
-          //  ^^^^^^^^^ these are column numbers /after/ pre-processing, so they don't match the original source
-          ;
-        switch (v.usage) 
-        {
-        case e_Undetermined: freport << "undetermined"; break;
-        case e_NotUsed:      freport << "notused"; break;
-        case e_Const:        freport << "const"; break;
-        case e_Temporary:    freport << "temp"; break;
-        case e_FlipFlop:     freport << "ff"; break;
-        case e_Bound:        freport << "bound"; break;
-        case e_Wire:         freport << "wire"; break;
-        }
-        freport << nxl;
+    auto tk = lint.getToken(v.source_interval);
+    std::string tk_text = v.name;
+    int         tk_line = -1;
+    if (tk) {
+      std::pair<std::string, int> fl = lint.getTokenSourceFileAndLine(tk);
+      tk_text = tk->getText();
+      tk_line = fl.second;
     }
+    freport
+      << tk_text << " "
+      << v.name << " "
+      << tk_line << " "
+      << "var "
+      ;
+    switch (v.usage) {
+    case e_Undetermined: freport << "undetermined #"; break;
+    case e_NotUsed:      freport << "notused #"; break;
+    case e_Const:        freport << "const " << FF_CST << '_' << v.name; break;
+    case e_Temporary:    freport << "temp " << FF_TMP << '_' << v.name; break;
+    case e_FlipFlop:     freport << "ff " << FF_D << '_' << v.name << ',' << FF_Q << '_' << v.name; break;
+    case e_Bound:        freport << "bound " << WIRE << '_' << v.name; break;
+    case e_Wire:         freport << "wire " << WIRE << '_' << v.name; break;
+    }
+    freport << nxl;
+  }
+  for (auto &v : m_Outputs) {
+    auto tk = lint.getToken(v.source_interval);
+    std::string tk_text = v.name;
+    int         tk_line = -1;
+    if (tk) {
+      std::pair<std::string, int> fl = lint.getTokenSourceFileAndLine(tk);
+      tk_text = tk->getText();
+      tk_line = fl.second;
+    }
+    freport
+      << tk_text << " "
+      << v.name << " "
+      << tk_line << " "
+      << "output ";
+    switch (v.usage) {
+    case e_Undetermined: freport << "undetermined #"; break;
+    case e_NotUsed:      freport << "notused #"; break;
+    case e_Const:        freport << "const " << FF_CST << '_' << v.name; break;
+    case e_Temporary:    freport << "temp " << FF_TMP << '_' << v.name; break;
+    case e_FlipFlop:     freport << "ff " << FF_D << '_' << v.name << ',' << FF_Q << '_' << v.name; break;
+    case e_Bound:        freport << "bound " << WIRE << '_' << v.name; break;
+    case e_Wire:         freport << "wire " << WIRE << '_' << v.name; break;
+    }
+    freport << nxl;
+  }
+  for (auto &v : m_Inputs) {
+    auto tk = lint.getToken(v.source_interval);
+    std::string tk_text = v.name;
+    int         tk_line = -1;
+    if (tk) {
+      std::pair<std::string, int> fl = lint.getTokenSourceFileAndLine(tk);
+      tk_text = tk->getText();
+      tk_line = fl.second;
+    }
+    freport
+      << tk_text << " "
+      << v.name << " "
+      << tk_line << " "
+      << "input wire " << ALG_INPUT << '_' << v.name;
+    freport << nxl;
   }
 }
 
 // -------------------------------------------------
 
-void Algorithm::enableVIOReport(std::string reportname)
+void Algorithm::enableReporting(std::string reportname)
 { 
-  m_VIOReportName = reportname;
+  m_ReportBaseName = reportname;
   for (auto alg : m_InstancedAlgorithms) {
-    alg.second.algo->enableVIOReport(reportname);
-  }
-}
-
-void Algorithm::enableFSMReport(std::string reportname)
-{
-  m_FSMReportName = reportname;
-  for (auto alg : m_InstancedAlgorithms) {
-    alg.second.algo->enableFSMReport(reportname);
+    alg.second.algo->enableReporting(reportname);
   }
 }
 

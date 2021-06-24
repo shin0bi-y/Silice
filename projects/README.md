@@ -17,12 +17,14 @@ A few projects rely on some external hardware (typical, low cost things: OLED, k
 
 ## Detailed tutorials
 
-Some of the projects have detailed explanations:
-- [pipelined sort](pipeline_sort/)
-- [HDMI test framework](hdmi_test/)
+Some of the projects have more detailed explanations and walk-throughs:
+- [HDMI tutorial](hdmi_test/)
+- [Compact RV32I RISC-V](ice-v/)
+- [Terrain fly-over demo](terrain/)
+- [RISC-V + graphics framework](fire-v/)
+- [SDRAM tutorial](sdram_test/)
 - [streaming audio from sdcard](audio_sdcard_streamer/)
-- [dual CPU RISC-V in graphics framework](ram-ice-v/)
-- [sdram test and controller introduction](sdram_test/)
+- [pipelined sort](pipeline_sort/)
 
 ## Building the examples
 

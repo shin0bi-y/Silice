@@ -1,11 +1,6 @@
 // SL 2020-06-12 @sylefeb
 //
-// Fun with RISC-V!
-// Fits an IceStick
-//
-// (can be further reduced!)
-//
-// RV32I cpu, see README.txt
+// Fun with RISC-V!   RV32I cpu, see README.md
 //
 //      GNU AFFERO GENERAL PUBLIC LICENSE
 //        Version 3, 19 November 2007
@@ -13,749 +8,249 @@
 //  A copy of the license full text is included in 
 //  the distribution, please refer to it for details.
 
-// Clocks
-$$if ICESTICK then
-import('../common/icestick_clk_60.v')
-$$end
-$$if FOMU then
-import('../common/fomu_clk_20.v')
-$$end
-
-// enable to see the registers during simulation
-$$SHOW_REGS = false
-
+// --------------------------------------------------
+// Processor
 // --------------------------------------------------
 
-// pre-compilation script, embeds compile code within BRAM
-$$dofile('pre_include_asm.lua')
+// bitfield for easier decoding of instructions
+bitfield Rtype { uint1 unused1, uint1 sign, uint5 unused2, uint5 rs2, 
+                 uint5 rs1,     uint3 op,   uint5 rd,      uint7 opcode}
 
 // --------------------------------------------------
+// execute: decoder + ALU
+// - decodes instructions
+// - performs all integer computations
 
-// bitfields for easier decoding of instructions ; these
-// define views on a uint32, that are used upon 
-// access, avoiding hard coded values in part-selects
-bitfield Itype {
-  uint12 imm,
-  uint5  rs1,
-  uint3  funct3,
-  uint5  rd,
-  uint7  opcode
-}
-
-bitfield Stype {
-  uint7  imm11_5,
-  uint5  rs2,
-  uint5  rs1,
-  uint3  funct3,
-  uint5  imm4_0,
-  uint7  opcode
-}
-
-bitfield Rtype {
-  uint1  unused_2,
-  uint1  select2,
-  uint5  unused_1,
-  uint5  rs2,
-  uint5  rs1,
-  uint3  funct3,
-  uint5  rd,
-  uint7  opcode
-}
-
-bitfield Utype {
-  uint20  imm31_12,
-  uint12  zero
-}
-
-bitfield Jtype {
-  uint1  imm20,
-  uint10 imm10_1,
-  uint1  imm11,
-  uint8  imm_19_12,
-  uint5  rd,
-  uint7  opcode
-}
-
-bitfield Btype {
-  uint1  imm12,
-  uint6  imm10_5,
-  uint5  rs2,
-  uint5  rs1,
-  uint3  funct3,
-  uint4  imm4_1,
-  uint1  imm11,
-  uint7  opcode
-}
-
-
-// --------------------------------------------------
-
-algorithm main( // I guess this is the SOC :-D
-  output! uint5 leds,
-$$if OLED then
-  output! uint1 oled_clk,
-  output! uint1 oled_mosi,
-  output! uint1 oled_dc,
-  output! uint1 oled_resn,
-  output! uint1 oled_csn,
-$$end
-$$if ICESTICK then
-  ) <@cpu_clock>
-{
-  // clock  
-  icestick_clk_60 clk_gen (
-    clock_in  <: clock,
-    clock_out :> cpu_clock
-  ); 
-$$elseif FOMU then
-  ) <@cpu_clock>
-{
-  // clock  
-  uint1 cpu_clock  = uninitialized;
-  fomu_clk_20 clk_gen (
-    clock_in  <: clock,
-    clock_out :> cpu_clock
-  );  
-  
-$$else
+algorithm execute(
+  // instruction, program counter and registers
+  input  uint32 instr, input  uint$addrW$ pc, input int32 xa, input int32 xb,
+  // trigger: pulsed high when the decoder + ALU should start
+  input  uint1  trigger, 
+  // outputs all information the processor needs to decide what to do next 
+  output uint3  op,    output uint5  write_rd, output  uint1  no_rd, 
+  output uint1  jump,  output uint1  load,     output  uint1  store,  
+  output int32  val,   output uint1  storeVal, output  uint1  working(0),
+  output uint32 n,     output uint1  storeAddr, // next address adder
+  output uint1  intop, output int32  r,         // integer operations
 ) {
-$$end
+  uint5  shamt(0);  uint32 cycle(0); // shifter status and cycle counter
 
-$$if OLED then
-  uint1 displ_en = uninitialized;
-  uint1 displ_dta_or_cmd := mem.wdata[10,1];
-  uint8 displ_byte       := mem.wdata[0,8];
-  oled display(
-    enable          <: displ_en,
-    data_or_command <: displ_dta_or_cmd,
-    byte            <: displ_byte,
-    oled_din        :> oled_mosi,
-    oled_clk        :> oled_clk,
-    oled_cs         :> oled_csn,
-    oled_dc         :> oled_dc,
-  );
-$$end
+  // ==== decode immediates
+  int32 imm_u  <: {instr[12,20],12b0};
+  int32 imm_j  <: {{12{instr[31,1]}},instr[12,8],instr[20,1],instr[21,10],1b0};
+  int32 imm_i  <: {{20{instr[31,1]}},instr[20,12]};
+  int32 imm_b  <: {{20{instr[31,1]}},instr[7,1],instr[25,6],instr[8,4],1b0};
+  int32 imm_s  <: {{20{instr[31,1]}},instr[25,7],instr[7,5]};
 
-  // ram
-  bram uint32 mem<input!>[] = $meminit$;
-  
-  uint11 wide_addr = uninitialized;
-  
-  // cpu
-  rv32i_cpu cpu(
-    mem_addr  :> wide_addr,
-    mem_rdata <: mem.rdata,
-    mem_wdata :> mem.wdata,
-    mem_wen   :> mem.wenable,
-  );
+  // ==== decode opcode
+  uint5 opcode    <: instr[ 2, 5];
+  uint1 AUIPC     <: opcode == 5b00101;  uint1 LUI    <: opcode == 5b01101;
+  uint1 JAL       <: opcode == 5b11011;  uint1 JALR   <: opcode == 5b11001;
+  uint1 IntImm    <: opcode == 5b00100;  uint1 IntReg <: opcode == 5b01100;
+  uint1 Cycles    <: opcode == 5b11100;  uint1 branch <: opcode == 5b11000;
+  uint1 regOrImm  <: IntReg  | branch;                    // reg or imm in ALU?
+  uint1 pcOrReg   <: AUIPC   | JAL    | branch;           // pc or reg in addr?
+  uint1 sub       <: IntReg  & Rtype(instr).sign;         // subtract
+  uint1 aluShift  <: (IntImm | IntReg) & op[0,2] == 2b01; // shift requested
 
-  mem.addr := wide_addr[0,10];
+  // ==== select next address adder first input
+  int32 addr_a    <: pcOrReg ? __signed({pc[0,$addrW-2$],2b0}) : xa;
+  // ==== select ALU second input 
+  int32 b         <: regOrImm ? (xb) : imm_i;
+    
+  // ==== allows to do subtraction and all comparisons with a single adder
+  // trick from femtorv32/swapforth/J1
+  int33 a_minus_b <: {1b1,~b} + {1b0,xa} + 33b1;
+  uint1 a_lt_b    <: (xa[31,1] ^ b[31,1]) ? xa[31,1] : a_minus_b[32,1];
+  uint1 a_lt_b_u  <: a_minus_b[32,1];
+  uint1 a_eq_b    <: a_minus_b[0,32] == 0;
 
-  // io mapping
-  always {
-$$if OLED then
-    displ_en = 0;
-$$end
-    if (mem.wenable & wide_addr[10,1]) {
-      leds = mem.wdata[0,5] & {5{wide_addr[0,1]}};
-$$if OLED then
-      // command
-      displ_en = (mem.wdata[9,1] | mem.wdata[10,1]) & wide_addr[1,1];
-      // reset
-      oled_resn = !(mem.wdata[0,1] & wide_addr[2,1]);
-$$end
-    }
-  }
-
-  // run the CPU
-  () <- cpu <- ();
-
-}
-
-// --------------------------------------------------
-// Help send bytes to the OLED screen
-// produces a quarter freq clock with one bit traveling a four bit ring
-// data is sent one main clock cycle before the OLED clock raises
-
-$$if OLED then
-
-algorithm oled(
-  input!  uint1 enable,
-  input!  uint1 data_or_command,
-  input!  uint8 byte,
-  output! uint1 oled_clk,
-  output! uint1 oled_din,
-  output! uint1 oled_cs,
-  output! uint1 oled_dc,
-) <autorun> {
-
-  uint2 osc        = 1;
-  uint1 dc         = 0;
-  uint9 sending    = 0;
-  
-  oled_cs := 0;
+  // ==== select immediate for the next address computation
+  // 'or trick' from femtorv32
+  int32 addr_imm  <: (AUIPC  ? imm_u : 32b0) | (JAL         ? imm_j : 32b0)
+                  |  (branch ? imm_b : 32b0) | ((JALR|load) ? imm_i : 32b0)
+                  |  (store  ? imm_s : 32b0);
+  // ==== set decoder outputs depending on incoming instructions
+  // load/store?
+  load         := opcode == 5b00000;   store        := opcode == 5b01000;   
+  // operator for load/store           // register to write to?
+  op           := Rtype(instr).op;     write_rd     := Rtype(instr).rd;    
+  // do we have to write a result to a register?
+  no_rd        := branch  | store  | (Rtype(instr).rd == 5b0);
+  // integer operations                // store next address?
+  intop        := (IntImm | IntReg);   storeAddr    := AUIPC;  
+  // value to store directly           // store value?
+  val          := LUI ? imm_u : cycle; storeVal     := LUI     | Cycles;   
+  // ==== increment cycle counter
+  cycle        := cycle + 1; 
   
   always {
-    oled_dc  =  dc;
-    osc      =  (sending>1) ? {osc[0,1],osc[1,1]} : 2b1;
-    oled_clk =  (sending>1) && (osc[0,1]); // SPI Mode 0
-    if (enable) {
-      dc         = data_or_command;
-      oled_dc    =  dc;
-      sending    = {1b1,
-        byte[0,1],byte[1,1],byte[2,1],byte[3,1],
-        byte[4,1],byte[5,1],byte[6,1],byte[7,1]};
+    int32 shift(0);  uint1 j(0); // temp variables for shifter and comparator
+
+    // ====================== ALU
+    // shift (one bit per clock)
+    if (working) {
+      // decrease shift size
+      shamt = shamt - 1;
+      // shift one bit
+      shift = op[2,1] ? (Rtype(instr).sign ? {r[31,1],r[1,31]} 
+                          : {__signed(1b0),r[1,31]}) : {r[0,31],__signed(1b0)};      
     } else {
-      oled_din   = sending[0,1];
-      if (osc[0,1]) {
-        sending   = {1b0,sending[1,8]};
-      }
+      // start shifting?
+      shamt = ((aluShift & trigger) ? __unsigned(b[0,5]) : 0);
+      // store value to be shifted
+      shift = xa;
     }
+    // are we still shifting?
+    working = (shamt != 0);
+
+    // all ALU operations
+    switch (op) {
+      case 3b000: { r = sub ? a_minus_b : xa + b; }            // ADD / SUB
+      case 3b010: { r = a_lt_b; } case 3b011: { r = a_lt_b_u; }// SLTI / SLTU
+      case 3b100: { r = xa ^ b; } case 3b110: { r = xa | b;   }// XOR / OR
+      case 3b001: { r = shift;  } case 3b101: { r = shift;    }// SLLI/SRLI/SRAI
+      case 3b111: { r = xa & b; }     // AND
+      default:    { r = {32{1bx}}; }  // don't care
+    }      
+
+    // ====================== Comparator for branching
+    switch (op[1,2]) {
+      case 2b00:  { j = a_eq_b;  } /*BEQ */ case 2b10: { j=a_lt_b;} /*BLT*/ 
+      case 2b11:  { j = a_lt_b_u;} /*BLTU*/ default:   { j = 1bx; }
+    }
+    jump = (JAL | JALR) | (branch & (j ^ op[0,1]));
+    //                                   ^^^^^^^ negates comparator result
+
+    // ====================== Next address adder
+    n = addr_a + addr_imm;
+
   }
+  
 }
-
-$$end
-
 
 // --------------------------------------------------
 // The Risc-V RV32I CPU itself
 
-algorithm rv32i_cpu(
-  output! uint12 mem_addr(0), // boot at 0x00
-  input   uint32 mem_rdata,
-  output! uint32 mem_wdata,
-  output! uint1  mem_wen,
-) <onehot> {
-  
-  //                 |--------- indicates we don't want the bram inputs to be latched
-  //                 v          writes have to be setup during the same clock cycle
-  bram int32 xregsA<input!>[32] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-  bram int32 xregsB<input!>[32] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-  
-  uint1  cmp         = uninitialized;
-  
-  uint5  write_rd    = uninitialized;
-  uint1  jump        = uninitialized;  
-  uint1  branch      = uninitialized;
-  
-  uint1  load_store  = uninitialized;
-  uint1  store       = uninitialized;
-  
-  uint3 select       = uninitialized;  
-  uint1 select2      = uninitialized;
+algorithm rv32i_cpu(bram_port mem, output! uint$addrW$ wide_addr ) <onehot> {
 
-  uint32 instr       = uninitialized;
-  uint12 pc          = uninitialized;
-  
-  uint12 next_pc   ::= pc+1; // next_pc tracks the expression 'pc + 1' using the
-                             // value of pc from the last clock edge (due to ::)
+  // register file, uses two BRAMs to fetch two registers at once
+  bram int32 xregsA[32] = {pad(0)}; bram int32 xregsB[32] = {pad(0)};
 
-$$if SIMULATION then  
-$$if SHOW_REGS then
-$$for i=0,31 do
-  int32 xv$i$ = uninitialized;
-$$end
-$$end
-$$end
+  // current instruction
+  uint32 instr(0);
 
-  uint3 funct3    := Btype(instr).funct3;
-  
-  int32  alu_out     = uninitialized;
-  uint1  alu_working = uninitialized;
-  uint1  alu_enable  = uninitialized;
-  intops alu(
-    enable  <: alu_enable,
-    pc      <: pc,
-    xa      <: xregsA.rdata,
-    xb      <: xregsB.rdata,
-    imm     <: imm,
-    forceZero   <: forceZero,
-    regOrPc     <: regOrPc,
-    regOrImm    <: regOrImm,
-    r       :> alu_out,
-    select  <: select,
-    select2 <: select2,
-    working :> alu_working
+  // program counter
+  uint$addrW$ pc   = uninitialized;
+  uint$addrW$ next_pc <:: pc + 1; // next_pc tracks the expression 'pc + 1'
+
+  // value that has been loaded from memory
+  int32 loaded     = uninitialized;
+
+  // decoder + ALU, executes the instruction and tells processor what to do
+  execute exec(
+    instr <:: instr, pc <:: pc, xa <: xregsA.rdata, xb <: xregsB.rdata
   );
 
-  int32 imm         = uninitialized;
-  uint1 forceZero   = uninitialized;
-  uint1 regOrPc     = uninitialized;
-  uint1 regOrImm    = uninitialized;
-  uint3 loadStoreOp = uninitialized;
-  decode dec(
-    instr       <:: instr,    // the <:: indicates we bind the variable as it was at the last
-    write_rd    :> write_rd,  // clock edge (as opposed to its value being modified in this cycle)
-    jump        :> jump,
-    branch      :> branch,
-    load_store  :> load_store,
-    store       :> store,
-    loadStoreOp :> loadStoreOp,
-    select      :> select,
-    select2     :> select2,
-    imm         :> imm,
-    forceZero   :> forceZero,
-    regOrPc     :> regOrPc,
-    regOrImm    :> regOrImm
-  );
- 
- intcmp cmps(
-    a      <: xregsA.rdata,
-    b      <: xregsB.rdata,
-    select <: funct3,
-    enable <: branch,
-    j      :> cmp
-  ); 
+  // The 'always_before' block is applied at the start of every cycle.
+  // This is a good place to set default values, which also indicates
+  // to Silice that some variables (e.g. xregsA.wdata) are fully set
+  // every cycle, enabling further optimizations.
+  // Default values are overriden from within the algorithm loop.
+  always_before {
+    // decodes values loaded from memory (used when exec.load == 1)
+    uint32 aligned <: mem.rdata >> {exec.n[0,2],3b000};
+    switch ( exec.op[0,2] ) { // LB / LBU, LH / LHU, LW
+      case 2b00:{ loaded = {{24{(~exec.op[2,1])&aligned[ 7,1]}},aligned[ 0,8]}; }
+      case 2b01:{ loaded = {{16{(~exec.op[2,1])&aligned[15,1]}},aligned[ 0,16]};}
+      case 2b10:{ loaded = aligned;   }
+      default:  { loaded = {32{1bx}}; } // don't care (does not occur)
+    }
+    // what to write on a store (used when exec.store == 1)
+    mem.wdata      = xregsB.rdata << {exec.n[0,2],3b000};
+    // maintain write enable low (pulses high when needed)
+    mem.wenable    = 4b0000; 
+    // maintain alu trigger low
+    exec.trigger   = 0;
+    // maintain register wenable low
+    // (pulsed when necessary)
+    xregsA.wenable = 0;
+    // default wide_addr to boot address
+    wide_addr      = 0;  // boot address
+  }
 
-$$if SIMULATION then
-  uint16 iter = 0;
-$$end
+  // the 'always_after' block is executed at the end of every cycle
+  always_after { 
+    // what do we write in register? (pc, alu or val, load is handled separately)
+    // 'or trick' from femtorv32
+    int32 write_back <: (exec.jump      ? (next_pc<<2)        : 32b0)
+                      | (exec.storeAddr ? exec.n[0,$addrW+2$] : 32b0)
+                      | (exec.storeVal  ? exec.val            : 32b0)
+                      | (exec.load      ? loaded              : 32b0)
+                      | (exec.intop     ? exec.r              : 32b0);
+    // write back data to both register BRAMs
+    xregsA.wdata   = write_back;      xregsB.wdata   = write_back;     
+    // xregsB written when xregsA is
+    xregsB.wenable = xregsA.wenable; 
+    // write to write_rd, else track instruction register
+    xregsA.addr    = xregsA.wenable ? exec.write_rd : Rtype(instr).rs1;
+    xregsB.addr    = xregsA.wenable ? exec.write_rd : Rtype(instr).rs2;
+    // track memory address in interface
+    mem.addr       = wide_addr;      
+  }
 
-  // maintain write enable low (pulses high when needed)
-  mem_wen        := 0; 
-  // maintain alu enable low (pulses high when needed)
-  alu_enable     := 0;
-  // maintain read registers (no latched, see bram parameter)
-  xregsA.wenable := 0;
-  xregsB.wenable := 0;
-  xregsA.addr    := Rtype(instr).rs1;
-  xregsB.addr    := Rtype(instr).rs2;  
-  // boot at 0x00
-//  mem_addr        = 0;
-  
-$$if SIMULATION then
-  while (iter < 4096) {
-    iter = iter + 1;
-$$else
+  // =========== CPU runs forever
   while (1) {
-$$end
 
-//    __display("pc %d",mem_addr);
+    // data is now available
+    instr           = mem.rdata;
+    pc              = mem.addr;
 
-    // mem_data is now available
-    instr = mem_rdata;
-    pc    = mem_addr;
-    // update register immediately
-    xregsA.addr = Rtype(instr).rs1;
-    xregsB.addr = Rtype(instr).rs2;  
+++: // wait for register read (BRAM takes one cycle)
 
-++: // decode
+    exec.trigger    = 1;
 
-    // decode is now available, ALU is running
-    alu_enable = 1;
+    while (1) { // decode + ALU refresh during the cycle entering the loop
 
-    while (1) {
+      // this operations loop allows to wait for ALU when needed
+      // it is built such that no cycles are wasted    
 
-        // load/store?        
-        // What happens here: we always load, and mask and store on SB,SH,SW.
-        // the reason being that the BRAM design currently does not support
-        // write masks (likely to evolve, but have to worry about compatibility 
-        // across architectures).
-        if (load_store) {        
-          // load data (NOTE: could skip if followed by SW)
-          mem_addr    = alu_out>>2;
-++: // wait data
-          if (~store) {
-            uint32 tmp = uninitialized;
-            switch ( loadStoreOp[0,2] ) {
-              case 2b00: { // LB / LBU
-                  switch (alu_out[0,2]) {
-                    case 2b00: { tmp = { {24{(~loadStoreOp[2,1])&mem_rdata[ 7,1]}},mem_rdata[ 0,8]}; }
-                    case 2b01: { tmp = { {24{(~loadStoreOp[2,1])&mem_rdata[15,1]}},mem_rdata[ 8,8]}; }
-                    case 2b10: { tmp = { {24{(~loadStoreOp[2,1])&mem_rdata[23,1]}},mem_rdata[16,8]}; }
-                    case 2b11: { tmp = { {24{(~loadStoreOp[2,1])&mem_rdata[31,1]}},mem_rdata[24,8]}; }
-                    default:   { tmp = 0; }
-                  }
-              }
-              case 2b01: { // LH / LHU
-                  switch (alu_out[1,1]) {
-                    case 1b0: { tmp = { {16{(~loadStoreOp[2,1])&mem_rdata[15,1]}},mem_rdata[ 0,16]}; }
-                    case 1b1: { tmp = { {16{(~loadStoreOp[2,1])&mem_rdata[31,1]}},mem_rdata[16,16]}; }
-                    default:  { tmp = 0; }
-                  }
-              }
-              case 2b10: { // LW
-                tmp = mem_rdata;  
-              }
-              default: { tmp = 0; }
-            }            
-//__display("LOAD addr: %h (%b) op: %b read: %h / %h", mem_addr, alu_out, loadStoreOp, mem_rdata, tmp);
-            // commit result
-            xregsA.wenable = 1;
-            xregsB.wenable = 1;
-            xregsA.wdata   = tmp;
-            xregsB.wdata   = tmp;
-            xregsA.addr    = write_rd;
-            xregsB.addr    = write_rd;
+      // load/store?        
+      if (exec.load | exec.store) {   
+        // memory address from wich to load/store
+        wide_addr   = exec.n >> 2;
+        // == Store (enabled below if exec.store == 1)
+        // build write mask depending on SB, SH, SW
+        // assumes aligned, e.g. SW => next_addr[0,2] == 2
+        mem.wenable = ({4{exec.store}} & { { 2{exec.op[0,2]==2b10} },
+                                               exec.op[0,1] | exec.op[1,1], 1b1 
+                                        } ) << exec.n[0,2];
 
-          } else {
-          
-//__display("STORE1 addr: %h (%b) op: %b d: %h",mem_addr,alu_out,loadStoreOp,mem_rdata);
-            switch (loadStoreOp) {
-              case 3b000: { // SB
-                  switch (alu_out[0,2]) {
-                    case 2b00: { mem_wdata = { mem_rdata[ 8,24] , xregsB.rdata[ 0,8] };              }
-                    case 2b01: { mem_wdata = { mem_rdata[16,16] , xregsB.rdata[ 0,8] , mem_rdata[0, 8] }; }
-                    case 2b10: { mem_wdata = { mem_rdata[24, 8] , xregsB.rdata[ 0,8] , mem_rdata[0,16] }; }
-                    case 2b11: { mem_wdata = {     xregsB.rdata[ 0,8] , mem_rdata[0,24] };           }
-                  }
-              }
-              case 3b001: { // SH
-                  switch (alu_out[1,1]) {
-                    case 1b0: { mem_wdata = {   mem_rdata[16,16] , xregsB.rdata[ 0,16] }; }
-                    case 1b1: { mem_wdata = { xregsB.rdata[0,16] , mem_rdata[0,16] }; }
-                  }
-              }
-              case 3b010: { // SW
-                mem_wdata   = xregsB.rdata;
-              }            
-              default: {  }
-            }
-//__display("STORE2 addr: %h op: %b write: %h",mem_addr,loadStoreOp,mem_wdata);
-            mem_addr    = alu_out>>2;
-            mem_wen     = 1;
-++: // wait write
+++: // wait for data transaction
 
-          }
-          
-          mem_addr = next_pc;
-          
-          break;
-          
-        } else {
-        
-          if (alu_working == 0) { // ALU done?
+        // == Load (enabled below if exec.load == 1)
+        // commit result
+        xregsA.wenable = ~exec.no_rd;        
+        // restore address to program counter
+        wide_addr      = next_pc;
+        // exit the operations loop
+        break;
+        //  instruction read from BRAM and write to register 
+        //  occurs as we jump back to loop start
 
-            // next instruction
-            mem_addr     = (jump | cmp) ? alu_out[2,12]  : next_pc;
-            // what do we write in register (pc or alu, load is handled above)
-            xregsA.wdata = (jump | cmp) ? (next_pc) << 2 : alu_out;
-            xregsB.wdata = (jump | cmp) ? (next_pc) << 2 : alu_out;
-            
-            // store result   
-            if (write_rd) {
-              // commit result
-              xregsA.wenable = 1;
-              xregsB.wenable = 1;
-              xregsA.addr    = write_rd;
-              xregsB.addr    = write_rd;
-            }        
-
-            break;
-          }      
+      } else {
+        // commit result
+        xregsA.wenable = ~exec.no_rd;
+        // next instruction address
+        wide_addr      = exec.jump ? (exec.n >> 2) : next_pc;
+        // ALU done?
+        if (exec.working == 0) {
+          // yes: all is correct, stop here
+          break; 
+          //  instruction read from BRAM and write to register 
+          //  occurs as we jump back to loop start
         }
       }
-
-$$if SIMULATION then  
-$$if SHOW_REGS then  
-++:
-  xregsA.wenable = 0;
-  xregsB.wenable = 0;
-  __display("------------------ registers A ------------------");
-$$for i=0,31 do
-      xregsA.addr = $i$;
-++:
-      xv$i$ = xregsA.rdata;
-$$end
-      __display("%h %h %h %h\\n%h %h %h %h\\n%h %h %h %h\\n%h %h %h %h",xv0,xv1,xv2,xv3,xv4,xv5,xv6,xv7,xv8,xv9,xv10,xv11,xv12,xv13,xv14,xv15);
-      __display("%h %h %h %h\\n%h %h %h %h\\n%h %h %h %h\\n%h %h %h %h",xv16,xv17,xv18,xv19,xv20,xv21,xv22,xv23,xv24,xv25,xv26,xv27,xv28,xv29,xv30,xv31);
-
-$$end
-$$end
-
-  }
-
-}
-
-// --------------------------------------------------
-// decode next instruction
-
-algorithm decode(
-  input   uint32  instr,
-  output! uint5   write_rd,
-  output! uint1   jump,
-  output! uint1   branch,
-  output! uint1   load_store,
-  output! uint1   store,
-  output! uint3   loadStoreOp,
-  output! uint3   select,
-  output! uint1   select2,
-  output! int32   imm,
-  output! uint1   forceZero,
-  output! uint1   regOrPc,
-  output! uint1   regOrImm
-) {
-  always {
-    switch (instr[ 0, 7])
-    {    
-      case 7b0010111: { // AUIPC
-        //__display("AUIPC");
-        write_rd    = Rtype(instr).rd;
-        jump        = 0;
-        branch      = 0;
-        load_store  = 0;
-        store       = 0;
-        select      = 0;
-        select2     = 0;           
-        imm         = {Utype(instr).imm31_12,12b0};
-        forceZero   = 1;
-        regOrPc     = 1; // pc
-        regOrImm    = 1; // imm
-      }
-      
-      case 7b0110111: { // LUI
-        //__display("LUI");
-        write_rd    = Rtype(instr).rd;
-        jump        = 0;
-        branch      = 0;
-        load_store  = 0;
-        store       = 0;
-        select      = 0;
-        select2     = 0;
-        imm         = {Utype(instr).imm31_12,12b0};
-        forceZero   = 0; // force x0
-        regOrPc     = 0; // reg
-        regOrImm    = 1; // imm
-      }
-      
-      case 7b1101111: { // JAL
-        //__display("JAL");
-        write_rd    = Rtype(instr).rd;
-        jump        = 1;
-        branch      = 0;
-        load_store  = 0;
-        store       = 0;
-        select      = 0;
-        select2     = 0;        
-        imm         = {
-           {12{Jtype(instr).imm20}},
-           Jtype(instr).imm_19_12,
-           Jtype(instr).imm11,
-           Jtype(instr).imm10_1,
-           1b0};
-        forceZero   = 1;
-        regOrPc     = 1; // pc
-        regOrImm    = 1; // imm           
-      }
-      
-      case 7b1100111: { // JALR
-        //__display("JALR");
-        write_rd    = Rtype(instr).rd;
-        jump        = 1;
-        branch      = 0;
-        load_store  = 0;
-        store       = 0;
-        select      = 0;
-        select2     = 0;        
-        imm         = {{20{instr[31,1]}},Itype(instr).imm};
-        forceZero   = 1;
-        regOrPc     = 0; // reg
-        regOrImm    = 1; // imm
-      }
-      
-      case 7b1100011: { // branch
-        // __display("BR*");
-        write_rd    = 0;
-        jump        = 0;
-        branch      = 1;
-        load_store  = 0;
-        store       = 0;
-        select      = 0;
-        select2     = 0;        
-        imm         = {
-            {20{Btype(instr).imm12}},
-            Btype(instr).imm11,
-            Btype(instr).imm10_5,
-            Btype(instr).imm4_1,
-            1b0
-            };
-        forceZero   = 1;
-        regOrPc     = 1; // pc
-        regOrImm    = 1; // imm
-      }
- 
-      case 7b0000011: { // load
-        // __display("LOAD");
-        write_rd    = Rtype(instr).rd;
-        jump        = 0;
-        branch      = 1;
-        load_store  = 1;
-        store       = 0;
-        loadStoreOp = Itype(instr).funct3;
-        select      = 0;
-        select2     = 0;
-        imm         = {{20{instr[31,1]}},Itype(instr).imm};
-        forceZero   = 1;
-        regOrPc     = 0; // reg
-        regOrImm    = 1; // imm
-      }
-      
-      case 7b0100011: { // store
-        // __display("STORE");
-        write_rd    = 0;
-        jump        = 0;
-        branch      = 0;
-        load_store  = 1;
-        store       = 1;
-        loadStoreOp = Itype(instr).funct3;
-        select      = 0;
-        select2     = 0;        
-        imm         = {{20{instr[31,1]}},Stype(instr).imm11_5,Stype(instr).imm4_0};
-        forceZero   = 1;
-        regOrPc     = 0; // reg
-        regOrImm    = 1; // imm
-      }
-
-      case 7b0010011: { // integer, immediate  
-        write_rd    = Rtype(instr).rd;
-        jump        = 0;
-        branch      = 0;
-        load_store  = 0;
-        store       = 0;
-        select      = Itype(instr).funct3;
-        select2     = instr[30,1] /*SRLI/SRAI*/ & (Itype(instr).funct3 != 3b000) /*not ADD*/;
-        imm         = {{20{instr[31,1]}},Itype(instr).imm};        
-        forceZero   = 1;
-        regOrPc     = 0; // reg
-        regOrImm    = 1; // imm
-      }
-      
-      case 7b0110011: { // integer, registers
-        // __display("REGOPS");
-        write_rd    = Rtype(instr).rd;
-        jump        = 0;
-        branch      = 0;
-        load_store  = 0;
-        store       = 0;
-        select      = Itype(instr).funct3;
-        select2     = Rtype(instr).select2;
-        imm         = 0;        
-        forceZero   = 1;
-        regOrPc     = 0; // reg
-        regOrImm    = 0; // reg
-      }
-      
-      default: {
-        write_rd    = 0;        
-        jump        = 0;
-        branch      = 0;
-        load_store  = 0;
-        store       = 0;    
-        select      = 0;
-        select2     = 0;
-        imm         = 0;
-        forceZero   = 0;
-        regOrPc     = 0; // reg
-        regOrImm    = 0; // reg        
-      }
     }
   }
 }
-
-// --------------------------------------------------
-// Performs integer computations
-
-algorithm intops(
-  input!  uint1  enable,  // input! tells the compiler that the input does not 
-  input!  uint12 pc,      // need to be latched, so we can save registers
-  input!  int32  xa,      // caller has to ensure consistency
-  input!  int32  xb,
-  input!  int32  imm,
-  input!  uint3  select,
-  input!  uint1  select2,
-  input!  uint1  forceZero,
-  input!  uint1  regOrPc,
-  input!  uint1  regOrImm,
-  output  int32  r,
-  output  uint1  working,
-) {
-  uint1 signed = 0;
-  uint1 dir    = 0;
-  uint5 shamt  = 0;
-  
-  int32 a := regOrPc  ? __signed({20b0,pc[0,10],2b0}) : (forceZero ? xa : __signed(32b0));
-  int32 b := regOrImm ? imm : (xb);
-  //      ^^
-  // using := during a declaration means that the variable now constantly tracks
-  // the declared expression (but it is no longer assignable)
-  // In other words, this is a wire!
-  
-  always { // this part of the algorithm is executed every clock
-  
-    if (shamt > 0) {
-    
-      // process the shift one bit at a time
-      r     = dir ? (signed ? {r[31,1],r[1,31]} : {__signed(1b0),r[1,31]}) : {r[0,31],__signed(1b0)};
-      shamt = shamt - 1;
-      
-    } else {
-
-      if (enable) {      
-        switch (select) {
-          case 3b000: { // ADD / SUB
-            int32 tmp = uninitialized;
-            if (select2) { tmp = -b; } else { tmp = b; }
-            r = a + tmp;
-          }
-          case 3b010: { // SLTI
-            if (__signed(a) < __signed(b)) { r = 32b1; } else { r = 32b0; }
-          }
-          case 3b011: { // SLTU
-            if (__unsigned(a) < __unsigned(b)) { r = 32b1; } else { r = 32b0; }
-          }
-          case 3b100: { r = a ^ b;} // XOR
-          case 3b110: { r = a | b;} // OR
-          case 3b111: { r = a & b;} // AND
-          case 3b001: { // SLLI
-            r       = a;
-            shamt   = __unsigned(b[0,5]);
-            signed  = select2;
-            dir     = 0;
-          }
-          case 3b101: { // SRLI / SRAI
-            r       = a;
-            shamt   = __unsigned(b[0,5]);
-            signed  = select2;
-            dir     = 1;
-          }
-        }        
-      }    
-      
-    }
-  
-    working = (shamt > 0);
-
-$$if SIMULATION then
-//__display("enable %b a = %d b = %d r = %d select=%d select2=%d working=%d shamt=%d",enable,a,b,r,select,select2,working,shamt);
-$$end
-  }
-  
-}
-
-// --------------------------------------------------
-// Performs integer comparisons
-
-algorithm intcmp(
-  input!  int32 a,
-  input!  int32 b,
-  input!  uint3 select,
-  input!  uint1 enable,
-  output! uint1 j,
-) {
-  always {  
-    switch (select) {
-      case 3b000: { j = enable & (a == b); } // BEQ
-      case 3b001: { j = enable & (a != b); } // BNE
-      case 3b100: { j = enable & (__signed(a)   <  __signed(b));   } // BLT
-      case 3b110: { j = enable & (__unsigned(a) <  __unsigned(b)); } // BLTU
-      case 3b101: { j = enable & (__signed(a)   >= __signed(b));   } // BGE
-      case 3b111: { j = enable & (__unsigned(a) >= __unsigned(b)); } // BGEU
-      default:    { j = 0; }
-    }
-$$if SIMULATION then
-//__display("a = %d b = %d j = %d select=%d",a,b,j,select);
-$$end
-  }
-}
-
-// --------------------------------------------------
