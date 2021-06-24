@@ -4,3 +4,6 @@
 [submodule "tools/silice_hardware_emulator/libs/LibSL"]
 	path = tools/silice_hardware_emulator/libs/LibSL
 	url = https://github.com/sylefeb/LibSL.git
+[submodule "tools/silice-debugger"]
+	path = tools/silice-debugger
+	url = git@github.com:shin0bi-y/silice-debugger.git
