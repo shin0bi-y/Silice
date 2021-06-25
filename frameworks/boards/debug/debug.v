@@ -61,7 +61,7 @@ initial begin
   // generate a 100 MHz clock
   repeat(4) #5 clk = ~clk; 
   rst_n = 1'b1;
-  forever #5 clk = ~clk;   
+  repeat(100000) #5 clk = ~clk;   
 `endif
 end
 
